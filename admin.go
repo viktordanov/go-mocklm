@@ -86,6 +86,30 @@ func handleAdminReset(state *ServerState) http.HandlerFunc {
 	}
 }
 
+// handleAdminGetRequests returns all recorded requests.
+func handleAdminGetRequests(state *ServerState) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		records := state.Requests()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"requests": records,
+		})
+	}
+}
+
+// handleAdminClearRequests clears all recorded requests.
+func handleAdminClearRequests(state *ServerState) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		state.ClearRequests()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "cleared",
+		})
+	}
+}
+
 // handleAdminGetPresets lists all available presets.
 func handleAdminGetPresets() http.HandlerFunc {
 	presets := builtinPresets()

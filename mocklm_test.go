@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // testServer creates an httptest.Server wired up like main.go.
@@ -758,4 +760,232 @@ func writeFile(path, content string) error {
 	defer f.Close()
 	_, err = f.WriteString(content)
 	return err
+}
+
+// testServerFromState creates a test server from an existing ServerState.
+func testServerFromState(state *ServerState) *httptest.Server {
+	return httptest.NewServer(buildMux(state))
+}
+
+// tPostJSON is a test helper that makes a POST request and fails the test on error.
+func tPostJSON(t *testing.T, url, body string, headers map[string]string) *http.Response {
+	t.Helper()
+	resp, err := postJSON(url, body, headers)
+	if err != nil {
+		t.Fatalf("POST %s failed: %v", url, err)
+	}
+	return resp
+}
+
+func TestTokenPriorityHeader(t *testing.T) {
+	// X-MockLM-Tokens header takes priority
+	cfg := defaultConfig()
+	cfg.OpenAI.Tokens = 5
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/chat/completions", strings.NewReader(openaiChatBody(false)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-MockLM-Tokens", "20")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	usage := body["usage"].(map[string]any)
+	if int(usage["completion_tokens"].(float64)) != 20 {
+		t.Errorf("expected 20 completion tokens from header, got %v", usage["completion_tokens"])
+	}
+}
+
+func TestTokenPriorityBody(t *testing.T) {
+	// body max_tokens honored when config enables it
+	cfg := defaultConfig()
+	cfg.OpenAI.Tokens = 5
+	cfg.OpenAI.HonorMaxTokens = true
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	body := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"max_tokens":15}`
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var respBody map[string]any
+	json.NewDecoder(resp.Body).Decode(&respBody)
+	usage := respBody["usage"].(map[string]any)
+	if int(usage["completion_tokens"].(float64)) != 15 {
+		t.Errorf("expected 15 from body max_tokens, got %v", usage["completion_tokens"])
+	}
+}
+
+func TestAllProviderRecording(t *testing.T) {
+	// All providers record requests
+	cfg := defaultConfig()
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	// OpenAI
+	resp1 := tPostJSON(t, ts.URL+"/v1/chat/completions", openaiChatBody(false), nil)
+	resp1.Body.Close()
+	// Anthropic
+	resp2 := tPostJSON(t, ts.URL+"/v1/messages", anthropicBody(false), map[string]string{
+		"x-api-key": "test", "anthropic-version": "2023-06-01",
+	})
+	resp2.Body.Close()
+
+	recs := state.Requests()
+	if len(recs) != 2 {
+		t.Fatalf("expected 2 recorded requests, got %d", len(recs))
+	}
+	if recs[0].Provider != "openai" {
+		t.Errorf("first request should be openai, got %s", recs[0].Provider)
+	}
+	if recs[1].Provider != "anthropic" {
+		t.Errorf("second request should be anthropic, got %s", recs[1].Provider)
+	}
+}
+
+func TestMaxConcurrent503(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.OpenAI.MaxConcurrent = 1
+	cfg.OpenAI.LatencyMs = 200
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	// First request takes 200ms
+	var wg sync.WaitGroup
+	statuses := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			resp := tPostJSON(t, ts.URL+"/v1/chat/completions", openaiChatBody(false), nil)
+			statuses[idx] = resp.StatusCode
+			resp.Body.Close()
+		}(i)
+		if i == 0 {
+			time.Sleep(10 * time.Millisecond) // ensure first request is in-flight
+		}
+	}
+	wg.Wait()
+
+	got503 := statuses[0] == 503 || statuses[1] == 503
+	if !got503 {
+		t.Errorf("expected one 503, got statuses %v", statuses)
+	}
+}
+
+func TestInvalidTokenHeaderReturns400(t *testing.T) {
+	cfg := defaultConfig()
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/chat/completions",
+		strings.NewReader(openaiChatBody(false)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-MockLM-Tokens", "not-a-number")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Errorf("expected 400 for invalid header, got %d", resp.StatusCode)
+	}
+}
+
+func TestTtftMs(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.OpenAI.TtftMs = 100
+	cfg.OpenAI.Tokens = 2
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	body := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	start := time.Now()
+	resp := tPostJSON(t, ts.URL+"/v1/chat/completions", body, nil)
+	defer resp.Body.Close()
+	// Read all SSE data
+	io.ReadAll(resp.Body)
+	elapsed := time.Since(start)
+
+	// Should take at least ttft_ms
+	if elapsed < 90*time.Millisecond {
+		t.Errorf("expected at least ~100ms for TTFT, took %v", elapsed)
+	}
+}
+
+func TestSlowHeaderMs(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.OpenAI.SlowHeaderMs = 100
+	cfg.OpenAI.Tokens = 2
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	start := time.Now()
+	resp := tPostJSON(t, ts.URL+"/v1/chat/completions", openaiChatBody(false), nil)
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	if elapsed < 90*time.Millisecond {
+		t.Errorf("expected at least ~100ms for slow header, took %v", elapsed)
+	}
+}
+
+func TestStreamDelayJitterMs(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.OpenAI.StreamDelayMs = 50
+	cfg.OpenAI.StreamDelayJitterMs = 40
+	cfg.OpenAI.Tokens = 5
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	body := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp := tPostJSON(t, ts.URL+"/v1/chat/completions", body, nil)
+	defer resp.Body.Close()
+
+	// Just verify it completes without error (jitter doesn't crash)
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(data), "[DONE]") {
+		t.Error("expected [DONE] in stream output")
+	}
+}
+
+func TestSseKeepaliveInStreamDelay(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.OpenAI.StreamDelayMs = 150
+	cfg.OpenAI.SseKeepaliveIntervalMs = 50
+	cfg.OpenAI.Tokens = 2
+	state := NewServerState(cfg)
+	ts := testServerFromState(state)
+	defer ts.Close()
+
+	body := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp := tPostJSON(t, ts.URL+"/v1/chat/completions", body, nil)
+	defer resp.Body.Close()
+
+	data, _ := io.ReadAll(resp.Body)
+	output := string(data)
+
+	// With 150ms delay and 50ms keepalive, we should see ping comments
+	if !strings.Contains(output, ": ping") {
+		t.Error("expected SSE ping comments during stream delay")
+	}
 }

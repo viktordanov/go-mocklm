@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -22,6 +25,37 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 
 		cfg, limiter := state.Anthropic()
 
+		// Max concurrent check
+		allowed, acquired := state.AcquireConcurrency("anthropic")
+		if !allowed {
+			writeErrorResponse(w, 503, "anthropic", "overloaded", "Too many concurrent requests")
+			return
+		}
+		if acquired {
+			defer state.ReleaseConcurrency("anthropic")
+		}
+
+		// Capture raw body for request recording
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeErrorResponse(w, 400, "anthropic", "invalid_request_error", "Failed to read body: "+err.Error())
+			return
+		}
+
+		// Record the request
+		headers := make(map[string]string)
+		for k := range r.Header {
+			headers[k] = r.Header.Get(k)
+		}
+		state.RecordRequest(RecordedRequest{
+			Timestamp: time.Now(),
+			Provider:  "anthropic",
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Headers:   headers,
+			Body:      json.RawMessage(rawBody),
+		})
+
 		var req struct {
 			Model     string `json:"model"`
 			Stream    bool   `json:"stream"`
@@ -31,7 +65,7 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 				Content string `json:"content"`
 			} `json:"messages"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
 			writeErrorResponse(w, 400, "anthropic", "invalid_request_error", "Invalid JSON: "+err.Error())
 			return
 		}
@@ -53,14 +87,31 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		if inputTokens < 1 {
 			inputTokens = 1
 		}
-		outputTokens := cfg.Tokens
 
-		words := generateWords(cfg.Tokens)
+		// Resolve output tokens: header > body > config
+		outputTokens, err := resolveTokenCount(r, &cfg, req.MaxTokens)
+		if err != nil {
+			writeErrorResponse(w, 400, "anthropic", "invalid_request_error", err.Error())
+			return
+		}
+
+		words := generateWords(outputTokens)
+		if cfg.Deterministic {
+			words = generateDeterministicWords(outputTokens)
+		}
 		model := req.Model
 		if model == "" {
 			model = "claude-3-haiku-20240307"
 		}
 		id := fmt.Sprintf("msg_mock_%d", time.Now().UnixNano())
+		if cfg.Deterministic {
+			id = "msg_mock_deterministic"
+		}
+
+		// slow_header_ms delay
+		if cfg.SlowHeaderMs > 0 {
+			time.Sleep(time.Duration(cfg.SlowHeaderMs) * time.Millisecond)
+		}
 
 		if req.Stream {
 			handleAnthropicStream(w, &cfg, id, model, words, inputTokens, outputTokens)
@@ -71,6 +122,32 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 }
 
 func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int) {
+	// Tool use response mode: return text + tool_use content blocks
+	if cfg.ToolUseResponse {
+		resp := map[string]any{
+			"id":    id,
+			"type":  "message",
+			"role":  "assistant",
+			"model": model,
+			"content": []map[string]any{
+				{"type": "text", "text": "I'll look that up for you."},
+				{"type": "tool_use", "id": "toolu_mock_123", "name": "get_weather", "input": map[string]any{
+					"location": "San Francisco",
+					"unit":     "celsius",
+				}},
+			},
+			"stop_reason":   "tool_use",
+			"stop_sequence": nil,
+			"usage": map[string]any{
+				"input_tokens":  inputTokens,
+				"output_tokens": outputTokens,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
 	content := joinContent(words)
 
 	contentBlocks := []map[string]any{}
@@ -93,13 +170,13 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 	})
 
 	resp := map[string]any{
-		"id":             id,
-		"type":           "message",
-		"role":           "assistant",
-		"content":        contentBlocks,
-		"model":          model,
-		"stop_reason":    "end_turn",
-		"stop_sequence":  nil,
+		"id":            id,
+		"type":          "message",
+		"role":          "assistant",
+		"content":       contentBlocks,
+		"model":         model,
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
 		"usage": map[string]any{
 			"input_tokens":  inputTokens,
 			"output_tokens": outputTokens,
@@ -112,6 +189,11 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 
 func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int) {
 	sse := newSSEWriter(w)
+
+	// TTFT delay
+	if cfg.TtftMs > 0 {
+		sleepWithPings(sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs)
+	}
 
 	// message_start
 	msgStart, _ := json.Marshal(map[string]any{
@@ -161,8 +243,16 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 				chunk += " "
 			}
 
-			if cfg.StreamDelayMs > 0 {
-				time.Sleep(time.Duration(cfg.StreamDelayMs) * time.Millisecond)
+			delay := cfg.StreamDelayMs
+			if cfg.StreamDelayJitterMs > 0 {
+				jitter := rand.Intn(cfg.StreamDelayJitterMs*2+1) - cfg.StreamDelayJitterMs
+				delay += jitter
+				if delay < 0 {
+					delay = 0
+				}
+			}
+			if delay > 0 {
+				sleepWithPings(sse, delay, cfg.SseKeepaliveIntervalMs)
 			}
 
 			thinkDelta, _ := json.Marshal(map[string]any{
@@ -200,8 +290,16 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 			return
 		}
 
-		if cfg.StreamDelayMs > 0 {
-			time.Sleep(time.Duration(cfg.StreamDelayMs) * time.Millisecond)
+		delay := cfg.StreamDelayMs
+		if cfg.StreamDelayJitterMs > 0 {
+			jitter := rand.Intn(cfg.StreamDelayJitterMs*2+1) - cfg.StreamDelayJitterMs
+			delay += jitter
+			if delay < 0 {
+				delay = 0
+			}
+		}
+		if delay > 0 {
+			sleepWithPings(sse, delay, cfg.SseKeepaliveIntervalMs)
 		}
 
 		token := word

@@ -37,6 +37,16 @@ func generateWords(n int) []string {
 	return words
 }
 
+// generateDeterministicWords returns a fixed sequence of words starting from index 0.
+// Used by deterministic presets so response content is predictable across runs.
+func generateDeterministicWords(n int) []string {
+	words := make([]string, n)
+	for i := range n {
+		words[i] = wordList[i%len(wordList)]
+	}
+	return words
+}
+
 func joinContent(words []string) string {
 	if len(words) == 0 {
 		return ""

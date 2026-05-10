@@ -22,8 +22,17 @@ type ProviderConfig struct {
 	DisconnectAfterChunks int     `toml:"disconnect_after_chunks" json:"disconnect_after_chunks"`
 	MalformedChunk        bool    `toml:"malformed_chunk" json:"malformed_chunk"`
 	RateLimitRPM          int     `toml:"rate_limit_rpm" json:"rate_limit_rpm"`
-	ReasoningTokens       int     `toml:"reasoning_tokens" json:"reasoning_tokens"`
-	ThinkingDelayMs       int     `toml:"thinking_delay_ms" json:"thinking_delay_ms"`
+	ReasoningTokens        int     `toml:"reasoning_tokens" json:"reasoning_tokens"`
+	ThinkingDelayMs        int     `toml:"thinking_delay_ms" json:"thinking_delay_ms"`
+	Deterministic          bool    `toml:"deterministic" json:"deterministic"`
+	ToolUseResponse        bool    `toml:"tool_use_response" json:"tool_use_response"`
+	HonorMaxTokens         bool   `toml:"honor_max_tokens" json:"honor_max_tokens"`
+	MinTokens              int    `toml:"min_tokens" json:"min_tokens"`
+	TtftMs                 int    `toml:"ttft_ms" json:"ttft_ms"`
+	StreamDelayJitterMs    int    `toml:"stream_delay_jitter_ms" json:"stream_delay_jitter_ms"`
+	SlowHeaderMs           int    `toml:"slow_header_ms" json:"slow_header_ms"`
+	MaxConcurrent          int    `toml:"max_concurrent" json:"max_concurrent"`
+	SseKeepaliveIntervalMs int    `toml:"sse_keepalive_interval_ms" json:"sse_keepalive_interval_ms"`
 }
 
 type Config struct {
@@ -63,6 +72,10 @@ func applyProviderDefaults(p *ProviderConfig) {
 
 	if p.ErrorStatus == 0 {
 		p.ErrorStatus = 500
+	}
+
+	if p.MinTokens == 0 {
+		p.MinTokens = 1
 	}
 }
 

@@ -78,5 +78,47 @@ func builtinPresets() map[string]Preset {
 			OpenAI:      ProviderConfig{Tokens: 20, ErrorRate: 0.5, ErrorStatus: 500},
 			Anthropic:   healthy,
 		},
+		"deterministic-anthropic": {
+			Name:        "deterministic-anthropic",
+			Description: "Deterministic Anthropic text response (fixed content, fixed ID)",
+			OpenAI:      healthy,
+			Anthropic:   ProviderConfig{Tokens: 5, ErrorStatus: 500, Deterministic: true},
+		},
+		"deterministic-anthropic-stream": {
+			Name:        "deterministic-anthropic-stream",
+			Description: "Deterministic Anthropic streaming (fixed content, fixed ID, no delay)",
+			OpenAI:      healthy,
+			Anthropic:   ProviderConfig{Tokens: 5, ErrorStatus: 500, Deterministic: true, StreamDelayMs: 0},
+		},
+		"deterministic-anthropic-tool-use": {
+			Name:        "deterministic-anthropic-tool-use",
+			Description: "Deterministic Anthropic response with tool_use content blocks",
+			OpenAI:      healthy,
+			Anthropic:   ProviderConfig{Tokens: 5, ErrorStatus: 500, Deterministic: true, ToolUseResponse: true},
+		},
+		"bench-small": {
+			Name:        "bench-small",
+			Description: "Benchmark: small responses, zero latency",
+			OpenAI:      ProviderConfig{Tokens: 10, ErrorStatus: 500, MinTokens: 1},
+			Anthropic:   ProviderConfig{Tokens: 10, ErrorStatus: 500, MinTokens: 1},
+		},
+		"bench-large": {
+			Name:        "bench-large",
+			Description: "Benchmark: large responses, zero latency",
+			OpenAI:      ProviderConfig{Tokens: 500, ErrorStatus: 500, MinTokens: 1},
+			Anthropic:   ProviderConfig{Tokens: 500, ErrorStatus: 500, MinTokens: 1},
+		},
+		"bench-realistic": {
+			Name:        "bench-realistic",
+			Description: "Benchmark: realistic latency profile",
+			OpenAI:      ProviderConfig{Tokens: 100, TtftMs: 50, StreamDelayMs: 20, StreamDelayJitterMs: 10, ErrorStatus: 500, MinTokens: 1},
+			Anthropic:   ProviderConfig{Tokens: 100, TtftMs: 50, StreamDelayMs: 20, StreamDelayJitterMs: 10, ErrorStatus: 500, MinTokens: 1},
+		},
+		"connection-pressure": {
+			Name:        "connection-pressure",
+			Description: "Connection pressure: limited concurrency with slow headers",
+			OpenAI:      ProviderConfig{Tokens: 20, MaxConcurrent: 10, SlowHeaderMs: 500, ErrorStatus: 500, MinTokens: 1},
+			Anthropic:   ProviderConfig{Tokens: 20, MaxConcurrent: 10, SlowHeaderMs: 500, ErrorStatus: 500, MinTokens: 1},
+		},
 	}
 }

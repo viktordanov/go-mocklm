@@ -137,6 +137,31 @@ thinking_delay_ms = 0
 | `rate_limit_rpm` | int | 0 | Sliding-window rate limit in requests per minute (0 = disabled) |
 | `reasoning_tokens` | int | 0 | Generate a thinking/reasoning block with this many tokens (0 = disabled) |
 | `thinking_delay_ms` | int | 0 | Extra delay (ms) to simulate thinking time before response |
+| `honor_max_tokens` | bool | false | When true, use the request body's `max_tokens` to determine output length |
+| `min_tokens` | int | 1 | Minimum output tokens (floor for header/body overrides) |
+| `ttft_ms` | int | 0 | Time-to-first-token delay (ms) before the first content chunk in streaming |
+| `stream_delay_jitter_ms` | int | 0 | Random jitter (+/-) added to `stream_delay_ms` per chunk |
+| `slow_header_ms` | int | 0 | Delay (ms) before writing response headers (simulates slow upstream) |
+| `max_concurrent` | int | 0 | Maximum concurrent requests per provider (0 = unlimited). Returns 503 when exceeded |
+| `sse_keepalive_interval_ms` | int | 0 | Emit `: ping` SSE comments at this interval during TTFT waits (0 = disabled) |
+
+## Token Count Resolution
+
+The number of output tokens (words) is resolved in priority order:
+
+1. **`X-MockLM-Tokens` header** — Per-request override. Set this header to an integer to control output length for a single request.
+2. **Body `max_tokens`** — Only used when `honor_max_tokens = true` in the provider config. Reads the request body's `max_tokens` (or `max_output_tokens` for the Responses API).
+3. **Config `tokens`** — The default from the provider config.
+
+All resolved values are clamped to a minimum of `min_tokens` (default: 1).
+
+```bash
+# Override output to 50 tokens for this request only
+curl -s http://localhost:9999/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-MockLM-Tokens: 50" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
+```
 
 ## Fault Injection
 
@@ -190,7 +215,7 @@ curl -s http://localhost:9999/admin/config \
 
 ## Presets
 
-11 built-in named configurations for common test scenarios:
+18 built-in named configurations for common test scenarios:
 
 | Preset | Description |
 |---|---|
@@ -205,6 +230,13 @@ curl -s http://localhost:9999/admin/config \
 | `openai-timeout` | OpenAI holds 5s then TCP RST |
 | `malformed-streams` | Both providers inject corrupt JSON mid-stream |
 | `flaky-openai` | OpenAI 50% error rate (500) |
+| `deterministic-anthropic` | Deterministic Anthropic text response (fixed content, fixed ID) |
+| `deterministic-anthropic-stream` | Deterministic Anthropic streaming (fixed content, fixed ID, no delay) |
+| `deterministic-anthropic-tool-use` | Deterministic Anthropic response with tool_use content blocks |
+| `bench-small` | Benchmark: small responses, zero latency |
+| `bench-large` | Benchmark: large responses, zero latency |
+| `bench-realistic` | Benchmark: realistic latency profile |
+| `connection-pressure` | Connection pressure: limited concurrency with slow headers |
 
 Activate a preset:
 
@@ -376,11 +408,11 @@ cd ../nanollm && MOCKLM_BINARY=../go-mocklm/mocklm cargo test --test integration
 | **No `finish_reason` variations** | Always returns `"stop"` / `"end_turn"` — no `"length"`, `"content_filter"`, `"tool_calls"` |
 | **No configurable response content** | Content is random words from a fixed vocabulary; can't return specific text for transform testing |
 | **No per-request fault injection** | Faults are global config; can't target a single request via header |
-| **No request recording** | No way to inspect what requests mocklm received (useful for verifying transformed requests) |
+| ~~**No request recording**~~ | ~~No way to inspect what requests mocklm received~~ (resolved: all providers now record requests via `/admin/requests`) |
 | **No mid-stream error events** | Can disconnect or inject malformed JSON, but can't inject a proper error JSON event mid-stream |
 | **No Responses API reasoning streaming** | Reasoning items only appear in the final `response.completed` event, not streamed incrementally |
 | **No provider-specific rate limit headers** | Only sets `Retry-After`; missing `x-ratelimit-*` (OpenAI) and `anthropic-ratelimit-*` headers |
-| **No SSE keep-alive/ping events** | Real providers send `: ping` comment lines as heartbeats |
-| **No `max_tokens` enforcement** | Always generates exactly `config.tokens` words regardless of the request's `max_tokens` |
+| ~~**No SSE keep-alive/ping events**~~ | ~~Real providers send `: ping` comment lines~~ (resolved: `sse_keepalive_interval_ms` emits pings during TTFT waits) |
+| ~~**No `max_tokens` enforcement**~~ | ~~Always generates exactly `config.tokens` words~~ (resolved: `honor_max_tokens` + `X-MockLM-Tokens` header) |
 | **No multi-modal content** | Text only — no image or audio content blocks |
 | **No Google/Gemini provider** | Only OpenAI and Anthropic |

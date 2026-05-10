@@ -47,6 +47,8 @@ func buildMux(state *ServerState) *http.ServeMux {
 	mux.HandleFunc("PUT /admin/preset/{name}", handleAdminPutPreset(state))
 	mux.HandleFunc("POST /admin/reset", handleAdminReset(state))
 	mux.HandleFunc("GET /admin/presets", handleAdminGetPresets())
+	mux.HandleFunc("GET /admin/requests", handleAdminGetRequests(state))
+	mux.HandleFunc("POST /admin/requests/clear", handleAdminClearRequests(state))
 
 	return mux
 }

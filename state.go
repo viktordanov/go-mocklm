@@ -1,6 +1,21 @@
 package main
 
-import "sync"
+import (
+	"encoding/json"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// RecordedRequest holds a captured upstream request.
+type RecordedRequest struct {
+	Timestamp time.Time              `json:"timestamp"`
+	Provider  string                 `json:"provider"`
+	Method    string                 `json:"method"`
+	Path      string                 `json:"path"`
+	Headers   map[string]string      `json:"headers"`
+	Body      json.RawMessage        `json:"body"`
+}
 
 // ServerState holds the mutable server configuration protected by a RWMutex.
 // Handlers read per-request snapshots via OpenAI()/Anthropic(); the admin API
@@ -12,6 +27,14 @@ type ServerState struct {
 	openaiRL     *RateLimiter
 	anthropicRL  *RateLimiter
 	activePreset string
+
+	// Request recording
+	recMu    sync.Mutex
+	records  []RecordedRequest
+
+	// Concurrency tracking
+	openaiActive    atomic.Int32
+	anthropicActive atomic.Int32
 }
 
 // NewServerState creates a ServerState from the initial config and builds rate limiters.
@@ -71,6 +94,29 @@ func (s *ServerState) Reset() {
 	s.rebuildLimiters()
 }
 
+// RecordRequest stores a captured request.
+func (s *ServerState) RecordRequest(rec RecordedRequest) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	s.records = append(s.records, rec)
+}
+
+// Requests returns all recorded requests.
+func (s *ServerState) Requests() []RecordedRequest {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	out := make([]RecordedRequest, len(s.records))
+	copy(out, s.records)
+	return out
+}
+
+// ClearRequests removes all recorded requests.
+func (s *ServerState) ClearRequests() {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	s.records = nil
+}
+
 // rebuildLimiters must be called under write lock.
 func (s *ServerState) rebuildLimiters() {
 	if s.cfg.OpenAI.RateLimitRPM > 0 {
@@ -84,4 +130,44 @@ func (s *ServerState) rebuildLimiters() {
 	} else {
 		s.anthropicRL = nil
 	}
+}
+
+// AcquireConcurrency attempts to acquire a concurrency slot for the provider.
+// Returns (allowed, acquired): allowed=false means 503; acquired=true means
+// ReleaseConcurrency must be called when done.
+func (s *ServerState) AcquireConcurrency(provider string) (allowed bool, acquired bool) {
+	cfg, _ := s.providerConfig(provider)
+	if cfg.MaxConcurrent <= 0 {
+		return true, false
+	}
+	counter := s.counterFor(provider)
+	for {
+		current := counter.Load()
+		if int(current) >= cfg.MaxConcurrent {
+			return false, false
+		}
+		if counter.CompareAndSwap(current, current+1) {
+			return true, true
+		}
+	}
+}
+
+// ReleaseConcurrency releases a concurrency slot for the provider.
+func (s *ServerState) ReleaseConcurrency(provider string) {
+	counter := s.counterFor(provider)
+	counter.Add(-1)
+}
+
+func (s *ServerState) counterFor(provider string) *atomic.Int32 {
+	if provider == "openai" {
+		return &s.openaiActive
+	}
+	return &s.anthropicActive
+}
+
+func (s *ServerState) providerConfig(provider string) (ProviderConfig, *RateLimiter) {
+	if provider == "openai" {
+		return s.OpenAI()
+	}
+	return s.Anthropic()
 }

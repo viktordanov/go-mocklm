@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -12,15 +15,47 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg, limiter := state.OpenAI()
 
+		// Max concurrent check
+		allowed, acquired := state.AcquireConcurrency("openai")
+		if !allowed {
+			writeErrorResponse(w, 503, "openai", "overloaded", "Too many concurrent requests")
+			return
+		}
+		if acquired {
+			defer state.ReleaseConcurrency("openai")
+		}
+
+		// Buffer body for recording
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Failed to read body: "+err.Error())
+			return
+		}
+
+		// Record request
+		headers := make(map[string]string)
+		for k := range r.Header {
+			headers[k] = r.Header.Get(k)
+		}
+		state.RecordRequest(RecordedRequest{
+			Timestamp: time.Now(),
+			Provider:  "openai",
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Headers:   headers,
+			Body:      json.RawMessage(rawBody),
+		})
+
 		var req struct {
-			Model    string `json:"model"`
-			Stream   bool   `json:"stream"`
-			Messages []struct {
+			Model     string `json:"model"`
+			Stream    bool   `json:"stream"`
+			MaxTokens int    `json:"max_tokens"`
+			Messages  []struct {
 				Role    string `json:"role"`
 				Content string `json:"content"`
 			} `json:"messages"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
 			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
 			return
 		}
@@ -33,7 +68,13 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 			time.Sleep(time.Duration(cfg.ThinkingDelayMs) * time.Millisecond)
 		}
 
-		// Calculate mock token counts
+		// Resolve output tokens: header > body > config
+		outputTokens, err := resolveTokenCount(r, &cfg, req.MaxTokens)
+		if err != nil {
+			writeErrorResponse(w, 400, "openai", "invalid_request_error", err.Error())
+			return
+		}
+
 		totalChars := 0
 		for _, m := range req.Messages {
 			totalChars += len(m.Content)
@@ -42,26 +83,30 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		if promptTokens < 1 {
 			promptTokens = 1
 		}
-		completionTokens := cfg.Tokens
 
-		words := generateWords(cfg.Tokens)
+		words := generateWords(outputTokens)
 		model := req.Model
 		if model == "" {
 			model = "gpt-4"
 		}
 		id := fmt.Sprintf("chatcmpl-mock-%d", time.Now().UnixNano())
 
+		// slow_header_ms delay
+		if cfg.SlowHeaderMs > 0 {
+			time.Sleep(time.Duration(cfg.SlowHeaderMs) * time.Millisecond)
+		}
+
 		if req.Stream {
-			handleOpenAIChatStream(w, &cfg, id, model, words, promptTokens, completionTokens)
+			handleOpenAIChatStream(w, &cfg, id, model, words, promptTokens, outputTokens)
 		} else {
-			handleOpenAIChatNonStream(w, &cfg, id, model, words, promptTokens, completionTokens)
+			handleOpenAIChatNonStream(w, &cfg, id, model, words, promptTokens, outputTokens)
 		}
 	}
 }
 
 func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int) {
 	if cfg.ReasoningTokens > 0 {
-		completionTokens = cfg.Tokens + cfg.ReasoningTokens
+		completionTokens = len(words) + cfg.ReasoningTokens
 	}
 
 	content := joinContent(words)
@@ -72,9 +117,9 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 	}
 	if cfg.ReasoningTokens > 0 {
 		usage["completion_tokens_details"] = map[string]any{
-			"reasoning_tokens":            cfg.ReasoningTokens,
-			"accepted_prediction_tokens":  0,
-			"rejected_prediction_tokens":  0,
+			"reasoning_tokens":           cfg.ReasoningTokens,
+			"accepted_prediction_tokens": 0,
+			"rejected_prediction_tokens": 0,
 		}
 		usage["prompt_tokens_details"] = map[string]any{
 			"cached_tokens": 0,
@@ -108,6 +153,11 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int) {
 	sse := newSSEWriter(w)
 
+	// TTFT delay
+	if cfg.TtftMs > 0 {
+		sleepWithPings(sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs)
+	}
+
 	// Role chunk
 	roleChunk := map[string]any{
 		"id":                 id,
@@ -136,8 +186,16 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 			return
 		}
 
-		if cfg.StreamDelayMs > 0 {
-			time.Sleep(time.Duration(cfg.StreamDelayMs) * time.Millisecond)
+		delay := cfg.StreamDelayMs
+		if cfg.StreamDelayJitterMs > 0 {
+			jitter := rand.Intn(cfg.StreamDelayJitterMs*2+1) - cfg.StreamDelayJitterMs
+			delay += jitter
+			if delay < 0 {
+				delay = 0
+			}
+		}
+		if delay > 0 {
+			sleepWithPings(sse, delay, cfg.SseKeepaliveIntervalMs)
 		}
 
 		token := word
@@ -174,7 +232,7 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 
 	// Adjust completion tokens for reasoning
 	if cfg.ReasoningTokens > 0 {
-		completionTokens = cfg.Tokens + cfg.ReasoningTokens
+		completionTokens = len(words) + cfg.ReasoningTokens
 	}
 
 	// Finish chunk with usage
@@ -239,4 +297,24 @@ func capitalize(s string) string {
 	}
 	r := []rune(s)
 	return strings.ToUpper(string(r[0])) + string(r[1:])
+}
+
+// sleepWithPings sleeps for totalMs, emitting SSE pings at keepaliveMs intervals.
+func sleepWithPings(sse *sseWriter, totalMs, keepaliveMs int) {
+	if keepaliveMs <= 0 || totalMs <= keepaliveMs {
+		time.Sleep(time.Duration(totalMs) * time.Millisecond)
+		return
+	}
+	remaining := totalMs
+	for remaining > 0 {
+		chunk := keepaliveMs
+		if chunk > remaining {
+			chunk = remaining
+		}
+		time.Sleep(time.Duration(chunk) * time.Millisecond)
+		remaining -= chunk
+		if remaining > 0 {
+			sse.writePing()
+		}
+	}
 }

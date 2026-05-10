@@ -41,3 +41,11 @@ func (s *sseWriter) writeDone() {
 		s.flusher.Flush()
 	}
 }
+
+// writePing writes an SSE comment line for keep-alive.
+func (s *sseWriter) writePing() {
+	fmt.Fprint(s.w, ": ping\n\n")
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
