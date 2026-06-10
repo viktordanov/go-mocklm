@@ -144,6 +144,28 @@ thinking_delay_ms = 0
 | `slow_header_ms` | int | 0 | Delay (ms) before writing response headers (simulates slow upstream) |
 | `max_concurrent` | int | 0 | Maximum concurrent requests per provider (0 = unlimited). Returns 503 when exceeded |
 | `sse_keepalive_interval_ms` | int | 0 | Emit `: ping` SSE comments at this interval during TTFT waits (0 = disabled) |
+| `stop_reason` | string | "" | Override the emitted stop reason. Anthropic: `stop_reason` (e.g. `pause_turn`, `refusal`). OpenAI: `finish_reason` (e.g. `content_filter`). Empty = default |
+| `cache_read_tokens` | int | 0 | Anthropic: add `usage.cache_read_input_tokens` to responses (0 = omitted) |
+| `cache_creation_tokens` | int | 0 | Anthropic: add `usage.cache_creation_input_tokens` to responses (0 = omitted) |
+
+## Request Fidelity
+
+- **Message content** may be a plain string or an array of typed content
+  blocks on both providers (Anthropic `text`/`tool_use`/`tool_result`/image
+  blocks, OpenAI multi-part content). Proxy-generated tool round-trips are
+  accepted, not 400'd.
+- **Tool echo**: when `tool_use_response = true`, the response calls the
+  *first tool offered in the request* (OpenAI `{type:"function",
+  function:{name}}`, `{type:"custom", custom:{name}}`, and Anthropic
+  `{name}` shapes are all recognized). Falls back to the fixed `get_weather`
+  call when no tools are offered.
+  - Anthropic streaming emits a real `tool_use` block with
+    `input_json_delta` fragments; OpenAI streaming emits a `tool_calls`
+    delta chunk. Both finish with the tool stop reason.
+- **Thinking**: an Anthropic request with `thinking: {type: "enabled"}` gets
+  a thinking block even when `reasoning_tokens` is 0.
+- **Recording cap**: the in-memory request recording keeps the most recent
+  1000 requests.
 
 ## Token Count Resolution
 

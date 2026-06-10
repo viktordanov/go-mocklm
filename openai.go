@@ -47,13 +47,11 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		})
 
 		var req struct {
-			Model     string `json:"model"`
-			Stream    bool   `json:"stream"`
-			MaxTokens int    `json:"max_tokens"`
-			Messages  []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"messages"`
+			Model     string          `json:"model"`
+			Stream    bool            `json:"stream"`
+			MaxTokens int             `json:"max_tokens"`
+			Messages  []chatMessage   `json:"messages"`
+			Tools     json.RawMessage `json:"tools"`
 		}
 		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
 			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
@@ -75,9 +73,18 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 			return
 		}
 
+		// Tool echo: respond with the first tool the caller offered.
+		toolName := firstRequestedToolName(req.Tools)
+		toolInput := map[string]any{"input": "mock-input"}
+		if toolName == "" {
+			toolName = "get_weather"
+			toolInput = map[string]any{"location": "San Francisco", "unit": "celsius"}
+		}
+
+		// Content may be a string or an array of content parts.
 		totalChars := 0
 		for _, m := range req.Messages {
-			totalChars += len(m.Content)
+			totalChars += m.contentChars()
 		}
 		promptTokens := totalChars / 4
 		if promptTokens < 1 {
@@ -97,14 +104,42 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		}
 
 		if req.Stream {
-			handleOpenAIChatStream(w, &cfg, id, model, words, promptTokens, outputTokens)
+			handleOpenAIChatStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput)
 		} else {
-			handleOpenAIChatNonStream(w, &cfg, id, model, words, promptTokens, outputTokens)
+			handleOpenAIChatNonStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput)
 		}
 	}
 }
 
-func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int) {
+// openaiFinishReason resolves the finish_reason to emit: explicit config
+// override first, then tool_calls for tool responses, then "stop".
+func openaiFinishReason(cfg *ProviderConfig) string {
+	if cfg.StopReason != "" {
+		return cfg.StopReason
+	}
+	if cfg.ToolUseResponse {
+		return "tool_calls"
+	}
+	return "stop"
+}
+
+// mockToolCalls builds an OpenAI tool_calls array echoing the requested tool.
+func mockToolCalls(toolName string, toolInput map[string]any) []map[string]any {
+	args, _ := json.Marshal(toolInput)
+	return []map[string]any{
+		{
+			"index": 0,
+			"id":    "call_mock_123",
+			"type":  "function",
+			"function": map[string]any{
+				"name":      toolName,
+				"arguments": string(args),
+			},
+		},
+	}
+}
+
+func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any) {
 	if cfg.ReasoningTokens > 0 {
 		completionTokens = len(words) + cfg.ReasoningTokens
 	}
@@ -126,6 +161,18 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 		}
 	}
 
+	message := map[string]any{
+		"role":    "assistant",
+		"content": content,
+	}
+	if cfg.ToolUseResponse {
+		message["content"] = nil
+		// Strip the streaming-only "index" key from the non-stream shape.
+		calls := mockToolCalls(toolName, toolInput)
+		delete(calls[0], "index")
+		message["tool_calls"] = calls
+	}
+
 	resp := map[string]any{
 		"id":                 id,
 		"object":             "chat.completion",
@@ -134,13 +181,10 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 		"system_fingerprint": "fp_mock",
 		"choices": []map[string]any{
 			{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": content,
-				},
+				"index":         0,
+				"message":       message,
 				"logprobs":      nil,
-				"finish_reason": "stop",
+				"finish_reason": openaiFinishReason(cfg),
 			},
 		},
 		"usage": usage,
@@ -150,7 +194,7 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 	json.NewEncoder(w).Encode(resp)
 }
 
-func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int) {
+func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any) {
 	sse := newSSEWriter(w)
 
 	// TTFT delay
@@ -230,6 +274,30 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 		sse.writeData(string(data))
 	}
 
+	// Tool call delta: a single chunk carrying the full call (valid per the
+	// OpenAI streaming spec; finer-grained argument deltas can come later).
+	if cfg.ToolUseResponse {
+		toolChunk := map[string]any{
+			"id":                 id,
+			"object":             "chat.completion.chunk",
+			"created":            time.Now().Unix(),
+			"model":              model,
+			"system_fingerprint": "fp_mock",
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{
+						"tool_calls": mockToolCalls(toolName, toolInput),
+					},
+					"logprobs":      nil,
+					"finish_reason": nil,
+				},
+			},
+		}
+		data, _ := json.Marshal(toolChunk)
+		sse.writeData(string(data))
+	}
+
 	// Adjust completion tokens for reasoning
 	if cfg.ReasoningTokens > 0 {
 		completionTokens = len(words) + cfg.ReasoningTokens
@@ -262,7 +330,7 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 				"index":         0,
 				"delta":         map[string]any{},
 				"logprobs":      nil,
-				"finish_reason": "stop",
+				"finish_reason": openaiFinishReason(cfg),
 			},
 		},
 		"usage": streamUsage,

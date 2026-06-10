@@ -57,13 +57,15 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		})
 
 		var req struct {
-			Model     string `json:"model"`
-			Stream    bool   `json:"stream"`
-			MaxTokens int    `json:"max_tokens"`
-			Messages  []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"messages"`
+			Model     string          `json:"model"`
+			Stream    bool            `json:"stream"`
+			MaxTokens int             `json:"max_tokens"`
+			Messages  []chatMessage   `json:"messages"`
+			Tools     json.RawMessage `json:"tools"`
+			Thinking  *struct {
+				Type         string `json:"type"`
+				BudgetTokens int    `json:"budget_tokens"`
+			} `json:"thinking"`
 		}
 		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
 			writeErrorResponse(w, 400, "anthropic", "invalid_request_error", "Invalid JSON: "+err.Error())
@@ -78,10 +80,25 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 			time.Sleep(time.Duration(cfg.ThinkingDelayMs) * time.Millisecond)
 		}
 
-		// Calculate mock token counts
+		// A request with thinking enabled gets a thinking block even when the
+		// config doesn't force one (cfg is a per-request copy).
+		if cfg.ReasoningTokens == 0 && req.Thinking != nil && req.Thinking.Type == "enabled" {
+			cfg.ReasoningTokens = 45
+		}
+
+		// Tool echo: respond with the first tool the caller offered, falling
+		// back to the legacy fixed tool when none was offered.
+		toolName := firstRequestedToolName(req.Tools)
+		toolInput := map[string]any{"input": "mock-input"}
+		if toolName == "" {
+			toolName = "get_weather"
+			toolInput = map[string]any{"location": "San Francisco", "unit": "celsius"}
+		}
+
+		// Calculate mock token counts (content may be string or block array)
 		totalChars := 0
 		for _, m := range req.Messages {
-			totalChars += len(m.Content)
+			totalChars += m.contentChars()
 		}
 		inputTokens := totalChars / 4
 		if inputTokens < 1 {
@@ -114,15 +131,44 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		}
 
 		if req.Stream {
-			handleAnthropicStream(w, &cfg, id, model, words, inputTokens, outputTokens)
+			handleAnthropicStream(w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput)
 		} else {
-			handleAnthropicNonStream(w, &cfg, id, model, words, inputTokens, outputTokens)
+			handleAnthropicNonStream(w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput)
 		}
 	}
 }
 
-func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int) {
-	// Tool use response mode: return text + tool_use content blocks
+// anthropicUsage builds the usage object, including prompt-cache fields when
+// configured.
+func anthropicUsage(cfg *ProviderConfig, inputTokens, outputTokens int) map[string]any {
+	usage := map[string]any{
+		"input_tokens":  inputTokens,
+		"output_tokens": outputTokens,
+	}
+	if cfg.CacheReadTokens > 0 {
+		usage["cache_read_input_tokens"] = cfg.CacheReadTokens
+	}
+	if cfg.CacheCreationTokens > 0 {
+		usage["cache_creation_input_tokens"] = cfg.CacheCreationTokens
+	}
+	return usage
+}
+
+// anthropicStopReason resolves the stop_reason to emit: explicit config
+// override first, then tool_use for tool responses, then end_turn.
+func anthropicStopReason(cfg *ProviderConfig) string {
+	if cfg.StopReason != "" {
+		return cfg.StopReason
+	}
+	if cfg.ToolUseResponse {
+		return "tool_use"
+	}
+	return "end_turn"
+}
+
+func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
+	// Tool use response mode: return text + tool_use content blocks echoing
+	// the first requested tool.
 	if cfg.ToolUseResponse {
 		resp := map[string]any{
 			"id":    id,
@@ -131,17 +177,11 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 			"model": model,
 			"content": []map[string]any{
 				{"type": "text", "text": "I'll look that up for you."},
-				{"type": "tool_use", "id": "toolu_mock_123", "name": "get_weather", "input": map[string]any{
-					"location": "San Francisco",
-					"unit":     "celsius",
-				}},
+				{"type": "tool_use", "id": "toolu_mock_123", "name": toolName, "input": toolInput},
 			},
-			"stop_reason":   "tool_use",
+			"stop_reason":   anthropicStopReason(cfg),
 			"stop_sequence": nil,
-			"usage": map[string]any{
-				"input_tokens":  inputTokens,
-				"output_tokens": outputTokens,
-			},
+			"usage":         anthropicUsage(cfg, inputTokens, outputTokens),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -175,19 +215,16 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 		"role":          "assistant",
 		"content":       contentBlocks,
 		"model":         model,
-		"stop_reason":   "end_turn",
+		"stop_reason":   anthropicStopReason(cfg),
 		"stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  inputTokens,
-			"output_tokens": outputTokens,
-		},
+		"usage":         anthropicUsage(cfg, inputTokens, outputTokens),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int) {
+func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
 	sse := newSSEWriter(w)
 
 	// TTFT delay
@@ -196,6 +233,7 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 	}
 
 	// message_start
+	startUsage := anthropicUsage(cfg, inputTokens, 1)
 	msgStart, _ := json.Marshal(map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -206,10 +244,7 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 			"model":         model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage": map[string]any{
-				"input_tokens":  inputTokens,
-				"output_tokens": 1,
-			},
+			"usage":         startUsage,
 		},
 	})
 	sse.writeEvent("message_start", string(msgStart))
@@ -330,11 +365,48 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 	})
 	sse.writeEvent("content_block_stop", string(blockStop))
 
+	// Tool use block: content_block_start + input_json_delta fragments +
+	// content_block_stop, like the real API streams tool calls.
+	if cfg.ToolUseResponse {
+		toolBlockIndex := textBlockIndex + 1
+
+		toolStart, _ := json.Marshal(map[string]any{
+			"type":  "content_block_start",
+			"index": toolBlockIndex,
+			"content_block": map[string]any{
+				"type":  "tool_use",
+				"id":    "toolu_mock_123",
+				"name":  toolName,
+				"input": map[string]any{},
+			},
+		})
+		sse.writeEvent("content_block_start", string(toolStart))
+
+		inputJSON, _ := json.Marshal(toolInput)
+		for _, fragment := range splitJSONFragments(string(inputJSON), 3) {
+			toolDelta, _ := json.Marshal(map[string]any{
+				"type":  "content_block_delta",
+				"index": toolBlockIndex,
+				"delta": map[string]any{
+					"type":         "input_json_delta",
+					"partial_json": fragment,
+				},
+			})
+			sse.writeEvent("content_block_delta", string(toolDelta))
+		}
+
+		toolStop, _ := json.Marshal(map[string]any{
+			"type":  "content_block_stop",
+			"index": toolBlockIndex,
+		})
+		sse.writeEvent("content_block_stop", string(toolStop))
+	}
+
 	// message_delta
 	msgDelta, _ := json.Marshal(map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
-			"stop_reason":   "end_turn",
+			"stop_reason":   anthropicStopReason(cfg),
 			"stop_sequence": nil,
 		},
 		"usage": map[string]any{
@@ -348,4 +420,22 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 		"type": "message_stop",
 	})
 	sse.writeEvent("message_stop", string(msgStop))
+}
+
+// splitJSONFragments splits a JSON string into n roughly equal pieces for
+// streaming as input_json_delta partial_json fragments.
+func splitJSONFragments(s string, n int) []string {
+	if n < 1 || len(s) <= n {
+		return []string{s}
+	}
+	size := (len(s) + n - 1) / n
+	fragments := make([]string, 0, n)
+	for start := 0; start < len(s); start += size {
+		end := start + size
+		if end > len(s) {
+			end = len(s)
+		}
+		fragments = append(fragments, s[start:end])
+	}
+	return fragments
 }
