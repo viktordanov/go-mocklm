@@ -94,11 +94,18 @@ func (s *ServerState) Reset() {
 	s.rebuildLimiters()
 }
 
+// maxRecordedRequests caps the in-memory recording buffer; the oldest
+// entries are dropped first. Prevents unbounded growth in long-lived runs.
+const maxRecordedRequests = 1000
+
 // RecordRequest stores a captured request.
 func (s *ServerState) RecordRequest(rec RecordedRequest) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	s.records = append(s.records, rec)
+	if len(s.records) > maxRecordedRequests {
+		s.records = s.records[len(s.records)-maxRecordedRequests:]
+	}
 }
 
 // Requests returns all recorded requests.

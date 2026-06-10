@@ -33,6 +33,15 @@ type ProviderConfig struct {
 	SlowHeaderMs           int    `toml:"slow_header_ms" json:"slow_header_ms"`
 	MaxConcurrent          int    `toml:"max_concurrent" json:"max_concurrent"`
 	SseKeepaliveIntervalMs int    `toml:"sse_keepalive_interval_ms" json:"sse_keepalive_interval_ms"`
+	// StopReason overrides the emitted stop reason. Anthropic responses use
+	// it for stop_reason (e.g. "pause_turn", "refusal"); OpenAI responses
+	// use it for finish_reason (e.g. "content_filter"). Empty = default.
+	StopReason string `toml:"stop_reason" json:"stop_reason"`
+	// CacheReadTokens / CacheCreationTokens add Anthropic prompt-cache usage
+	// fields (cache_read_input_tokens / cache_creation_input_tokens) to
+	// responses when > 0.
+	CacheReadTokens     int `toml:"cache_read_tokens" json:"cache_read_tokens"`
+	CacheCreationTokens int `toml:"cache_creation_tokens" json:"cache_creation_tokens"`
 }
 
 type Config struct {
