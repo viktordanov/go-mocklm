@@ -31,6 +31,8 @@ func buildMux(state *ServerState) *http.ServeMux {
 
 	// Provider endpoints
 	mux.HandleFunc("POST /v1/chat/completions", handleOpenAIChat(state))
+	mux.HandleFunc("POST /v1/completions", handleOpenAICompletions(state))
+	mux.HandleFunc("POST /v1/embeddings", handleOpenAIEmbeddings(state))
 	mux.HandleFunc("GET /v1/models", handleOpenAIModels())
 	mux.HandleFunc("POST /v1/messages", handleAnthropicMessages(state))
 	mux.HandleFunc("POST /v1/responses", handleOpenAIResponses(state))
