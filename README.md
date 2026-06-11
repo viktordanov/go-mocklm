@@ -145,6 +145,7 @@ thinking_delay_ms = 0
 | `max_concurrent` | int | 0 | Maximum concurrent requests per provider (0 = unlimited). Returns 503 when exceeded |
 | `sse_keepalive_interval_ms` | int | 0 | Emit `: ping` SSE comments at this interval during TTFT waits (0 = disabled) |
 | `stop_reason` | string | "" | Override the emitted stop reason. Anthropic: `stop_reason` (e.g. `pause_turn`, `refusal`). OpenAI: `finish_reason` (e.g. `content_filter`). Empty = default |
+| `strict` | bool | false | Contract-oracle mode (Anthropic): reject requests the real API would 400 — unknown top-level fields, missing `model`/`messages`/`max_tokens`, `temperature` outside [0,1], OpenAI tool wrappers / string `tool_choice` / OpenAI roles / `image_url` blocks, and missing required fields on common content blocks. Bounded depth (see `strict.go`); field sets mirror `CreateMessageParams` in Anthropic's OpenAPI spec |
 | `cache_read_tokens` | int | 0 | Anthropic: add `usage.cache_read_input_tokens` to responses (0 = omitted) |
 | `cache_creation_tokens` | int | 0 | Anthropic: add `usage.cache_creation_input_tokens` to responses (0 = omitted) |
 

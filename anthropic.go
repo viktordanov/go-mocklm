@@ -76,6 +76,15 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 			return
 		}
 
+		// Strict mode: contract-oracle validation against the real API's
+		// request schema (after fault injection, like a real gateway).
+		if cfg.Strict {
+			if msg := validateAnthropicStrict(rawBody); msg != "" {
+				writeErrorResponse(w, 400, "anthropic", "invalid_request_error", msg)
+				return
+			}
+		}
+
 		if cfg.ThinkingDelayMs > 0 {
 			time.Sleep(time.Duration(cfg.ThinkingDelayMs) * time.Millisecond)
 		}
@@ -138,20 +147,24 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 	}
 }
 
-// anthropicUsage builds the usage object, including prompt-cache fields when
-// configured.
+// anthropicUsage builds the usage object with the full field set the real
+// API always sends (spec Usage.required — all nullable extras emitted as
+// null/zero like real responses, cache fields driven by config knobs).
 func anthropicUsage(cfg *ProviderConfig, inputTokens, outputTokens int) map[string]any {
-	usage := map[string]any{
-		"input_tokens":  inputTokens,
-		"output_tokens": outputTokens,
+	return map[string]any{
+		"input_tokens":                inputTokens,
+		"output_tokens":               outputTokens,
+		"cache_read_input_tokens":     cfg.CacheReadTokens,
+		"cache_creation_input_tokens": cfg.CacheCreationTokens,
+		"cache_creation": map[string]any{
+			"ephemeral_5m_input_tokens": cfg.CacheCreationTokens,
+			"ephemeral_1h_input_tokens": 0,
+		},
+		"server_tool_use":       nil,
+		"service_tier":          "standard",
+		"inference_geo":         nil,
+		"output_tokens_details": nil,
 	}
-	if cfg.CacheReadTokens > 0 {
-		usage["cache_read_input_tokens"] = cfg.CacheReadTokens
-	}
-	if cfg.CacheCreationTokens > 0 {
-		usage["cache_creation_input_tokens"] = cfg.CacheCreationTokens
-	}
-	return usage
 }
 
 // anthropicStopReason resolves the stop_reason to emit: explicit config
@@ -176,11 +189,14 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 			"role":  "assistant",
 			"model": model,
 			"content": []map[string]any{
-				{"type": "text", "text": "I'll look that up for you."},
-				{"type": "tool_use", "id": "toolu_mock_123", "name": toolName, "input": toolInput},
+				{"type": "text", "text": "I'll look that up for you.", "citations": nil},
+				{"type": "tool_use", "id": "toolu_mock_123", "name": toolName,
+					"input": toolInput, "caller": map[string]any{"type": "direct"}},
 			},
 			"stop_reason":   anthropicStopReason(cfg),
 			"stop_sequence": nil,
+			"stop_details":  nil,
+			"container":     nil,
 			"usage":         anthropicUsage(cfg, inputTokens, outputTokens),
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -199,14 +215,16 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 		}
 		thinkingText := joinContent(generateWords(thinkingWordCount))
 		contentBlocks = append(contentBlocks, map[string]any{
-			"type":     "thinking",
-			"thinking": thinkingText,
+			"type":      "thinking",
+			"thinking":  thinkingText,
+			"signature": "sig_mock",
 		})
 	}
 
 	contentBlocks = append(contentBlocks, map[string]any{
-		"type": "text",
-		"text": content,
+		"type":      "text",
+		"text":      content,
+		"citations": nil,
 	})
 
 	resp := map[string]any{
@@ -217,6 +235,8 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 		"model":         model,
 		"stop_reason":   anthropicStopReason(cfg),
 		"stop_sequence": nil,
+		"stop_details":  nil,
+		"container":     nil,
 		"usage":         anthropicUsage(cfg, inputTokens, outputTokens),
 	}
 
@@ -244,6 +264,8 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 			"model":         model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
+			"stop_details":  nil,
+			"container":     nil,
 			"usage":         startUsage,
 		},
 	})
@@ -261,9 +283,11 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 
 		// content_block_start for thinking
 		thinkStart, _ := json.Marshal(map[string]any{
-			"type":          "content_block_start",
-			"index":         0,
-			"content_block": map[string]any{"type": "thinking", "thinking": ""},
+			"type":  "content_block_start",
+			"index": 0,
+			"content_block": map[string]any{
+				"type": "thinking", "thinking": "", "signature": "",
+			},
 		})
 		sse.writeEvent("content_block_start", string(thinkStart))
 
@@ -301,6 +325,17 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 			sse.writeEvent("content_block_delta", string(thinkDelta))
 		}
 
+		// signature_delta closes the thinking block like the real API
+		sigDelta, _ := json.Marshal(map[string]any{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]any{
+				"type":      "signature_delta",
+				"signature": "sig_mock",
+			},
+		})
+		sse.writeEvent("content_block_delta", string(sigDelta))
+
 		// content_block_stop for thinking
 		thinkStop, _ := json.Marshal(map[string]any{
 			"type":  "content_block_stop",
@@ -315,7 +350,7 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 	blockStart, _ := json.Marshal(map[string]any{
 		"type":          "content_block_start",
 		"index":         textBlockIndex,
-		"content_block": map[string]any{"type": "text", "text": ""},
+		"content_block": map[string]any{"type": "text", "text": "", "citations": nil},
 	})
 	sse.writeEvent("content_block_start", string(blockStart))
 
@@ -374,10 +409,11 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 			"type":  "content_block_start",
 			"index": toolBlockIndex,
 			"content_block": map[string]any{
-				"type":  "tool_use",
-				"id":    "toolu_mock_123",
-				"name":  toolName,
-				"input": map[string]any{},
+				"type":   "tool_use",
+				"id":     "toolu_mock_123",
+				"name":   toolName,
+				"input":  map[string]any{},
+				"caller": map[string]any{"type": "direct"},
 			},
 		})
 		sse.writeEvent("content_block_start", string(toolStart))
@@ -402,15 +438,24 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 		sse.writeEvent("content_block_stop", string(toolStop))
 	}
 
-	// message_delta
+	// message_delta — full MessageDelta + MessageDeltaUsage shapes per the
+	// spec (delta carries container/stop_details; usage carries the full
+	// required set, input_tokens included).
 	msgDelta, _ := json.Marshal(map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   anthropicStopReason(cfg),
 			"stop_sequence": nil,
+			"container":     nil,
+			"stop_details":  nil,
 		},
 		"usage": map[string]any{
-			"output_tokens": outputTokens,
+			"input_tokens":                inputTokens,
+			"output_tokens":               outputTokens,
+			"cache_read_input_tokens":     cfg.CacheReadTokens,
+			"cache_creation_input_tokens": cfg.CacheCreationTokens,
+			"output_tokens_details":       nil,
+			"server_tool_use":             nil,
 		},
 	})
 	sse.writeEvent("message_delta", string(msgDelta))

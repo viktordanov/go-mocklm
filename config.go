@@ -37,6 +37,10 @@ type ProviderConfig struct {
 	// it for stop_reason (e.g. "pause_turn", "refusal"); OpenAI responses
 	// use it for finish_reason (e.g. "content_filter"). Empty = default.
 	StopReason string `toml:"stop_reason" json:"stop_reason"`
+	// Strict enables contract-oracle request validation (Anthropic):
+	// unknown top-level fields, missing required fields, and out-of-range
+	// values are rejected with 400 like the real API (strict.go).
+	Strict bool `toml:"strict" json:"strict"`
 	// CacheReadTokens / CacheCreationTokens add Anthropic prompt-cache usage
 	// fields (cache_read_input_tokens / cache_creation_input_tokens) to
 	// responses when > 0.
