@@ -1,5 +1,6 @@
 # Compiled binary
 mocklm
+go-mocklm
 
 # Go build artifacts
 *.exe
