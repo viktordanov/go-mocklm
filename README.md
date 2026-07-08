@@ -146,8 +146,13 @@ thinking_delay_ms = 0
 | `sse_keepalive_interval_ms` | int | 0 | Emit `: ping` SSE comments at this interval during TTFT waits (0 = disabled) |
 | `stop_reason` | string | "" | Override the emitted stop reason. Anthropic: `stop_reason` (e.g. `pause_turn`, `refusal`). OpenAI: `finish_reason` (e.g. `content_filter`). Empty = default |
 | `strict` | bool | false | Contract-oracle mode (Anthropic): reject requests the real API would 400 — unknown top-level fields, missing `model`/`messages`/`max_tokens`, `temperature` outside [0,1], OpenAI tool wrappers / string `tool_choice` / OpenAI roles / `image_url` blocks, and missing required fields on common content blocks. Bounded depth (see `strict.go`); field sets mirror `CreateMessageParams` in Anthropic's OpenAPI spec |
-| `cache_read_tokens` | int | 0 | Anthropic: add `usage.cache_read_input_tokens` to responses (0 = omitted) |
+| `cache_read_tokens` | int | 0 | Prompt-cache reads: Anthropic `usage.cache_read_input_tokens`, OpenAI `usage.prompt_tokens_details.cached_tokens` |
 | `cache_creation_tokens` | int | 0 | Anthropic: add `usage.cache_creation_input_tokens` to responses (0 = omitted) |
+| `fail_first_n` | int | 0 | Deterministically fail the first N requests (per provider) with `error_status`, then succeed. Counter resets on config update/reset. Deterministic alternative to `error_rate` |
+| `disconnect_after_event` | string | "" | Anthropic streaming: TCP RST immediately after the named SSE event type is written (e.g. `message_delta` leaves a stop_reason but no `message_stop`; `content_block_start` cuts before any delta) |
+| `emit_nonstandard_fields` | bool | false | Inject genuinely-unknown probe fields (`x_mock_unknown_field` on Anthropic message shapes / `message_delta.delta`, `x_mock_unknown_usage_field` on usage) as an unknown-field-tolerance fault. Spec-required nullable fields (`stop_details`, `usage.inference_geo`, `usage.output_tokens_details`) are always emitted regardless — they are in the pinned spec's `Message.required`/`Usage.required` |
+| `suppress_ping_events` | bool | false | Anthropic streaming: omit the typed `ping` event after `message_start`. The real API sends it, but the pinned spec's `MessageStreamEvent` union has no ping arm — use this for strict schema-validation harnesses |
+| `legacy_stream_usage` | bool | false | OpenAI streaming: restore the old mock usage shape (usage rides the finish chunk unconditionally, `stream_options.include_usage` ignored). Default emits the real API shape |
 
 ## Request Fidelity
 
@@ -190,6 +195,13 @@ curl -s http://localhost:9999/v1/chat/completions \
 
 Faults are checked in order. The first matching fault short-circuits the response.
 
+Injected error envelopes are schema-valid per the pinned specs: Anthropic
+bodies carry `type`/`error`/`request_id` with the error type mapped to the
+real union member for the status (`529 → overloaded_error`, `5xx → api_error`,
+`429 → rate_limit_error`, `4xx → invalid_request_error`, plus
+401/403/404/504 mappings); OpenAI bodies carry `type`/`message`/`param`/`code`
+(`5xx → server_error`).
+
 ### Pre-Response Faults
 
 Checked before any content is generated:
@@ -197,9 +209,30 @@ Checked before any content is generated:
 | Priority | Fault | Trigger | Behavior |
 |---|---|---|---|
 | 1 | Rate limit | `rate_limit_rpm > 0` | 429 + `Retry-After` header + provider-format error JSON |
-| 2 | Random error | `error_rate > 0` (random roll) | Returns `error_status` with provider-format error JSON |
-| 3 | Timeout | `timeout_ms > 0` | Sleeps, then hijacks the TCP socket and sends RST |
-| 4 | Latency | `latency_ms > 0` | Sleeps before proceeding to generate the response |
+| 2 | Deterministic error | `fail_first_n > 0` (first N requests per provider) | Returns `error_status` with provider-format error JSON |
+| 3 | Random error | `error_rate > 0` (random roll) | Returns `error_status` with provider-format error JSON |
+| 4 | Timeout | `timeout_ms > 0` | Sleeps, then hijacks the TCP socket and sends RST |
+| 5 | Latency | `latency_ms > 0` | Sleeps before proceeding to generate the response |
+
+### Per-Request Fault Targeting: `X-MockLM-Fault` header
+
+Any provider-config knob can be overridden for a single request by sending a
+JSON fragment in the `X-MockLM-Fault` header (mirrors `X-MockLM-Tokens`).
+Keys absent from the JSON keep their configured values; invalid JSON returns
+400. This makes faults hermetic — one test can mix healthy and faulty
+requests against the same server:
+
+```bash
+# This request fails with 503; concurrent requests without the header succeed
+curl -s http://localhost:9999/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H 'X-MockLM-Fault: {"error_rate":1.0,"error_status":503}' \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Note: `rate_limit_rpm` and `max_concurrent` are inherently cross-request and
+cannot be targeted per request; the `fail_first_n` counter is shared per
+provider between header- and config-driven use.
 
 ### Mid-Stream Faults
 
@@ -208,6 +241,7 @@ Checked per-chunk during streaming:
 | Fault | Trigger | Behavior |
 |---|---|---|
 | Disconnect | `disconnect_after_chunks > 0` | TCP hijack + RST after N content chunks. No `[DONE]` sentinel. |
+| Event-scheduled disconnect | `disconnect_after_event = "message_delta"` (Anthropic) | TCP hijack + RST immediately after the named event type is written — cuts *between* protocol events rather than by word count |
 | Malformed chunk | `malformed_chunk = true` | Injects `{INVALID JSON CORRUPT` at chunk `totalChunks/2`. Stream **continues** after the bad chunk. |
 
 ### Examples
@@ -361,10 +395,16 @@ data: {"id":"chatcmpl-mock-...","object":"chat.completion.chunk","choices":[{"in
 
 data: {"id":"chatcmpl-mock-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"neural."},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-mock-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{...}}
+data: {"id":"chatcmpl-mock-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 ```
+
+Usage follows the real API's `stream_options.include_usage` contract: without
+it, no chunk carries a `usage` key; with it, every chunk carries
+`"usage": null` and a final trailing chunk with `"choices": []` carries the
+usage object (before `[DONE]`). Set `legacy_stream_usage = true` to restore
+the old mock shape (usage on the finish chunk, unconditionally).
 
 ### Anthropic Messages (`/v1/messages`)
 
@@ -373,6 +413,9 @@ SSE format: `event: {type}\ndata: {json}\n\n`.
 ```
 event: message_start
 data: {"type":"message_start","message":{"id":"msg_mock_...","role":"assistant","content":[],"model":"claude-3-haiku-20240307",...}}
+
+event: ping
+data: {"type":"ping"}    (real-API behavior; suppress_ping_events omits it — no ping arm in the pinned MessageStreamEvent union)
 
 event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
@@ -430,7 +473,7 @@ cd ../nanollm && MOCKLM_BINARY=../go-mocklm/mocklm cargo test --test integration
 | **No tool/function call emulation** | Can't test tool_calls proxy path |
 | **No `finish_reason` variations** | Always returns `"stop"` / `"end_turn"` — no `"length"`, `"content_filter"`, `"tool_calls"` |
 | **No configurable response content** | Content is random words from a fixed vocabulary; can't return specific text for transform testing |
-| **No per-request fault injection** | Faults are global config; can't target a single request via header |
+| ~~**No per-request fault injection**~~ | ~~Faults are global config; can't target a single request via header~~ (resolved: `X-MockLM-Fault` header overlays any provider knob per request) |
 | ~~**No request recording**~~ | ~~No way to inspect what requests mocklm received~~ (resolved: all providers now record requests via `/admin/requests`) |
 | **No mid-stream error events** | Can disconnect or inject malformed JSON, but can't inject a proper error JSON event mid-stream |
 | **No Responses API reasoning streaming** | Reasoning items only appear in the final `response.completed` event, not streamed incrementally |

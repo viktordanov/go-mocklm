@@ -54,8 +54,81 @@ func (rl *RateLimiter) Allow() (bool, int) {
 	return true, 0
 }
 
+// applyFaultHeader overlays per-request fault knobs from the X-MockLM-Fault
+// header — a JSON ProviderConfig fragment, e.g.
+// {"error_rate":1.0,"error_status":503} — onto this request's config
+// snapshot, mirroring the X-MockLM-Tokens header (tokens.go). Keys absent
+// from the JSON keep their configured values. Note: rate_limit_rpm and
+// max_concurrent are inherently cross-request and cannot be targeted here.
+func applyFaultHeader(r *http.Request, cfg *ProviderConfig) error {
+	h := r.Header.Get("X-MockLM-Fault")
+	if h == "" {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(h), cfg); err != nil {
+		return fmt.Errorf("invalid X-MockLM-Fault header value: %v", err)
+	}
+	return nil
+}
+
+// faultErrorStatus resolves the status and provider-valid error type for an
+// injected error, defaulting to 500 when error_status is unset. Anthropic
+// types follow the pinned spec's ErrorResponse discriminator mapping (there
+// is no "server_error" arm); OpenAI's Error.type is a free-form string where
+// the real API uses server_error for 5xx.
+func faultErrorStatus(cfg *ProviderConfig, provider string) (int, string) {
+	status := cfg.ErrorStatus
+	if status == 0 {
+		status = 500
+	}
+	if provider == "anthropic" {
+		return status, anthropicErrorType(status)
+	}
+	switch {
+	case status == 429:
+		return status, "rate_limit_error"
+	case status >= 500:
+		return status, "server_error"
+	default:
+		return status, "invalid_request_error"
+	}
+}
+
+// anthropicErrorType maps an HTTP status to the error union member the real
+// Anthropic API uses for it (spec ErrorResponse discriminator mapping).
+func anthropicErrorType(status int) string {
+	switch status {
+	case 400:
+		return "invalid_request_error"
+	case 401:
+		return "authentication_error"
+	case 403:
+		return "permission_error"
+	case 404:
+		return "not_found_error"
+	case 429:
+		return "rate_limit_error"
+	case 504:
+		return "timeout_error"
+	case 529:
+		return "overloaded_error"
+	}
+	if status >= 500 {
+		return "api_error"
+	}
+	return "invalid_request_error"
+}
+
 // checkFaults runs fault injection checks. Returns true if the request was handled (caller should return).
-func checkFaults(w http.ResponseWriter, _ *http.Request, cfg *ProviderConfig, limiter *RateLimiter, provider string) bool {
+func checkFaults(w http.ResponseWriter, r *http.Request, cfg *ProviderConfig, limiter *RateLimiter, state *ServerState, provider string) bool {
+	// 0. Per-request fault targeting: the header overlays cfg, so knobs it
+	// sets also steer everything downstream of checkFaults (stream faults,
+	// stop reasons, strict mode, ...).
+	if err := applyFaultHeader(r, cfg); err != nil {
+		writeErrorResponse(w, 400, provider, "invalid_request_error", err.Error())
+		return true
+	}
+
 	// 1. Rate limiting
 	if cfg.RateLimitRPM > 0 && limiter != nil {
 		allowed, retryAfter := limiter.Allow()
@@ -66,13 +139,22 @@ func checkFaults(w http.ResponseWriter, _ *http.Request, cfg *ProviderConfig, li
 		}
 	}
 
-	// 2. Random error
-	if cfg.ErrorRate > 0 && rand.Float64() < cfg.ErrorRate {
-		errType := "server_error"
-		if cfg.ErrorStatus == 429 {
-			errType = "rate_limit_error"
+	// 2a. Deterministic fail-first-N: the first N requests per provider fail
+	// with error_status, then requests succeed. The counter lives on
+	// ServerState (reset on config update/reset) and is shared by header-
+	// and config-driven fail_first_n.
+	if cfg.FailFirstN > 0 && state != nil {
+		if seq := state.NextFailSeq(provider); seq <= int64(cfg.FailFirstN) {
+			status, errType := faultErrorStatus(cfg, provider)
+			writeErrorResponse(w, status, provider, errType, fmt.Sprintf("Simulated deterministic error %d/%d (status %d)", seq, cfg.FailFirstN, status))
+			return true
 		}
-		writeErrorResponse(w, cfg.ErrorStatus, provider, errType, fmt.Sprintf("Simulated error (status %d)", cfg.ErrorStatus))
+	}
+
+	// 2b. Random error
+	if cfg.ErrorRate > 0 && rand.Float64() < cfg.ErrorRate {
+		status, errType := faultErrorStatus(cfg, provider)
+		writeErrorResponse(w, status, provider, errType, fmt.Sprintf("Simulated error (status %d)", status))
 		return true
 	}
 
@@ -125,6 +207,10 @@ func hijackAndClose(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusBadGateway)
 }
 
+// writeErrorResponse writes a provider-shaped error envelope carrying every
+// key the pinned specs require: Anthropic ErrorResponse.required is
+// {type, error, request_id}; OpenAI Error.required is
+// {type, message, param, code} (param/code nullable).
 func writeErrorResponse(w http.ResponseWriter, status int, provider, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -137,12 +223,14 @@ func writeErrorResponse(w http.ResponseWriter, status int, provider, errType, me
 				"type":    errType,
 				"message": message,
 			},
+			"request_id": fmt.Sprintf("req_mock_%d", time.Now().UnixNano()),
 		}
 	} else {
 		body = map[string]any{
 			"error": map[string]any{
 				"message": message,
 				"type":    errType,
+				"param":   nil,
 				"code":    errType,
 			},
 		}

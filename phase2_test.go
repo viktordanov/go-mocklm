@@ -207,16 +207,31 @@ func TestStreamingFixturesCarrySpecShapes(t *testing.T) {
 	}
 	text := raw.String()
 
+	// stop_details / inference_geo / output_tokens_details are REQUIRED
+	// nullable fields per the pinned spec (Message.required, Usage.required,
+	// MessageDelta.required, MessageDeltaUsage.required) and must be present
+	// on the default wire.
 	for _, want := range []string{
 		`"signature_delta"`,
-		`"stop_details":null`,
 		`"container":null`,
+		`"stop_details":null`,
 		`"input_tokens":`,
-		`"output_tokens_details":null`,
 		`"server_tool_use":null`,
+		`"inference_geo":null`,
+		`"output_tokens_details":null`,
+		"event: ping",
+		`{"type":"ping"}`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("stream missing spec shape %s:\n%s", want, text)
+		}
+	}
+
+	// Genuinely-unknown probe fields appear only under the
+	// emit_nonstandard_fields fault knob.
+	for _, banned := range []string{"x_mock_unknown_field", "x_mock_unknown_usage_field"} {
+		if strings.Contains(text, banned) {
+			t.Fatalf("stream must not carry nonstandard field %s by default:\n%s", banned, text)
 		}
 	}
 }
@@ -254,6 +269,9 @@ func TestResponseCarriesSpecRequiredFields(t *testing.T) {
 			t.Fatalf("message must carry %s (spec Message.required)", key)
 		}
 	}
+	if _, ok := out["x_mock_unknown_field"]; ok {
+		t.Fatal("unknown-field probe must be absent by default")
+	}
 
 	content := out["content"].([]any)
 	text := content[0].(map[string]any)
@@ -275,6 +293,9 @@ func TestResponseCarriesSpecRequiredFields(t *testing.T) {
 		if _, ok := usage[key]; !ok {
 			t.Fatalf("usage must carry %s (spec Usage.required), got %v", key, usage)
 		}
+	}
+	if _, ok := usage["x_mock_unknown_usage_field"]; ok {
+		t.Fatalf("unknown-field probe must be absent from usage by default, got %v", usage)
 	}
 	if usage["cache_read_input_tokens"] != float64(7) {
 		t.Fatalf("cache knob must drive cache_read_input_tokens, got %v", usage)

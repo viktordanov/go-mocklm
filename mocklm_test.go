@@ -279,9 +279,10 @@ func TestOpenAIChatStreaming(t *testing.T) {
 	if fc["finish_reason"] != "stop" {
 		t.Errorf("expected finish_reason=stop, got %v", fc["finish_reason"])
 	}
-	// Verify usage in finish chunk
-	if finishChunk["usage"] == nil {
-		t.Error("missing usage in finish chunk")
+	// Without stream_options.include_usage the real API sends no usage
+	// anywhere in the stream.
+	if _, ok := finishChunk["usage"]; ok {
+		t.Error("usage must be absent when include_usage is not requested")
 	}
 
 	// [DONE] sentinel
@@ -401,9 +402,10 @@ func TestAnthropicStreaming(t *testing.T) {
 	}
 
 	// Expected event sequence:
-	// message_start, content_block_start, 3x content_block_delta, content_block_stop, message_delta, message_stop
+	// message_start, ping, content_block_start, 3x content_block_delta, content_block_stop, message_delta, message_stop
 	expectedEvents := []string{
 		"message_start",
+		"ping",
 		"content_block_start",
 		"content_block_delta",
 		"content_block_delta",
@@ -436,9 +438,18 @@ func TestAnthropicStreaming(t *testing.T) {
 		t.Errorf("expected role=assistant, got %v", msg["role"])
 	}
 
+	// Verify the typed ping payload
+	var ping map[string]any
+	if err := json.Unmarshal([]byte(events[1].Data), &ping); err != nil {
+		t.Fatalf("failed to parse ping: %v", err)
+	}
+	if ping["type"] != "ping" {
+		t.Errorf("expected typed ping event, got %v", ping)
+	}
+
 	// Verify content deltas have text
 	var assembled string
-	for i := 2; i <= 4; i++ {
+	for i := 3; i <= 5; i++ {
 		var delta map[string]any
 		if err := json.Unmarshal([]byte(events[i].Data), &delta); err != nil {
 			t.Fatalf("failed to parse content_block_delta %d: %v", i, err)
@@ -453,7 +464,7 @@ func TestAnthropicStreaming(t *testing.T) {
 
 	// Verify message_delta has stop_reason
 	var msgDelta map[string]any
-	if err := json.Unmarshal([]byte(events[6].Data), &msgDelta); err != nil {
+	if err := json.Unmarshal([]byte(events[7].Data), &msgDelta); err != nil {
 		t.Fatalf("failed to parse message_delta: %v", err)
 	}
 	d := msgDelta["delta"].(map[string]any)

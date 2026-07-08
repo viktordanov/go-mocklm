@@ -17,7 +17,7 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 		// Max concurrent check
 		allowed, acquired := state.AcquireConcurrency("openai")
 		if !allowed {
-			writeErrorResponse(w, 503, "openai", "overloaded", "Too many concurrent requests")
+			writeErrorResponse(w, 503, "openai", "server_error", "Too many concurrent requests")
 			return
 		}
 		if acquired {
@@ -59,7 +59,7 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 			return
 		}
 
-		if checkFaults(w, r, &cfg, limiter, "openai") {
+		if checkFaults(w, r, &cfg, limiter, state, "openai") {
 			return
 		}
 

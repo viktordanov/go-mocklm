@@ -18,7 +18,7 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		// Max concurrent check
 		allowed, acquired := state.AcquireConcurrency("openai")
 		if !allowed {
-			writeErrorResponse(w, 503, "openai", "overloaded", "Too many concurrent requests")
+			writeErrorResponse(w, 503, "openai", "server_error", "Too many concurrent requests")
 			return
 		}
 		if acquired {
@@ -47,18 +47,21 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		})
 
 		var req struct {
-			Model     string          `json:"model"`
-			Stream    bool            `json:"stream"`
-			MaxTokens int             `json:"max_tokens"`
-			Messages  []chatMessage   `json:"messages"`
-			Tools     json.RawMessage `json:"tools"`
+			Model         string          `json:"model"`
+			Stream        bool            `json:"stream"`
+			MaxTokens     int             `json:"max_tokens"`
+			Messages      []chatMessage   `json:"messages"`
+			Tools         json.RawMessage `json:"tools"`
+			StreamOptions *struct {
+				IncludeUsage bool `json:"include_usage"`
+			} `json:"stream_options"`
 		}
 		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
 			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
 			return
 		}
 
-		if checkFaults(w, r, &cfg, limiter, "openai") {
+		if checkFaults(w, r, &cfg, limiter, state, "openai") {
 			return
 		}
 
@@ -104,7 +107,8 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		}
 
 		if req.Stream {
-			handleOpenAIChatStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput)
+			includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+			handleOpenAIChatStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput, includeUsage)
 		} else {
 			handleOpenAIChatNonStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput)
 		}
@@ -121,6 +125,27 @@ func openaiFinishReason(cfg *ProviderConfig) string {
 		return "tool_calls"
 	}
 	return "stop"
+}
+
+// openaiUsage builds the chat usage object. The real API sends the
+// prompt/completion *_details sub-objects unconditionally, not only when
+// reasoning is in play.
+func openaiUsage(cfg *ProviderConfig, promptTokens, completionTokens int) map[string]any {
+	return map[string]any{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + completionTokens,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": cfg.CacheReadTokens,
+			"audio_tokens":  0,
+		},
+		"completion_tokens_details": map[string]any{
+			"reasoning_tokens":           cfg.ReasoningTokens,
+			"audio_tokens":               0,
+			"accepted_prediction_tokens": 0,
+			"rejected_prediction_tokens": 0,
+		},
+	}
 }
 
 // mockToolCalls builds an OpenAI tool_calls array echoing the requested tool.
@@ -145,25 +170,13 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 	}
 
 	content := joinContent(words)
-	usage := map[string]any{
-		"prompt_tokens":     promptTokens,
-		"completion_tokens": completionTokens,
-		"total_tokens":      promptTokens + completionTokens,
-	}
-	if cfg.ReasoningTokens > 0 {
-		usage["completion_tokens_details"] = map[string]any{
-			"reasoning_tokens":           cfg.ReasoningTokens,
-			"accepted_prediction_tokens": 0,
-			"rejected_prediction_tokens": 0,
-		}
-		usage["prompt_tokens_details"] = map[string]any{
-			"cached_tokens": 0,
-		}
-	}
+	usage := openaiUsage(cfg, promptTokens, completionTokens)
 
 	message := map[string]any{
-		"role":    "assistant",
-		"content": content,
+		"role":        "assistant",
+		"content":     content,
+		"refusal":     nil,
+		"annotations": []any{},
 	}
 	if cfg.ToolUseResponse {
 		message["content"] = nil
@@ -179,6 +192,7 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 		"created":            time.Now().Unix(),
 		"model":              model,
 		"system_fingerprint": "fp_mock",
+		"service_tier":       "default",
 		"choices": []map[string]any{
 			{
 				"index":         0,
@@ -194,8 +208,15 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 	json.NewEncoder(w).Encode(resp)
 }
 
-func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any) {
+func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any, includeUsage bool) {
 	sse := newSSEWriter(w)
+
+	// Streaming usage shape (real API): usage appears only when the request
+	// set stream_options.include_usage — "usage": null on every chunk, then
+	// one trailing chunk with empty choices carrying the totals. The old
+	// mock shape (usage riding the finish chunk unconditionally) stays
+	// available behind the legacy_stream_usage compat flag.
+	usageNullOnChunks := includeUsage && !cfg.LegacyStreamUsage
 
 	// TTFT delay
 	if cfg.TtftMs > 0 {
@@ -209,6 +230,7 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 		"created":            time.Now().Unix(),
 		"model":              model,
 		"system_fingerprint": "fp_mock",
+		"service_tier":       "default",
 		"choices": []map[string]any{
 			{
 				"index": 0,
@@ -220,6 +242,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 				"finish_reason": nil,
 			},
 		},
+	}
+	if usageNullOnChunks {
+		roleChunk["usage"] = nil
 	}
 	data, _ := json.Marshal(roleChunk)
 	sse.writeData(string(data))
@@ -259,6 +284,7 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 			"created":            time.Now().Unix(),
 			"model":              model,
 			"system_fingerprint": "fp_mock",
+			"service_tier":       "default",
 			"choices": []map[string]any{
 				{
 					"index": 0,
@@ -269,6 +295,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 					"finish_reason": nil,
 				},
 			},
+		}
+		if usageNullOnChunks {
+			contentChunk["usage"] = nil
 		}
 		data, _ := json.Marshal(contentChunk)
 		sse.writeData(string(data))
@@ -283,6 +312,7 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 			"created":            time.Now().Unix(),
 			"model":              model,
 			"system_fingerprint": "fp_mock",
+			"service_tier":       "default",
 			"choices": []map[string]any{
 				{
 					"index": 0,
@@ -294,6 +324,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 				},
 			},
 		}
+		if usageNullOnChunks {
+			toolChunk["usage"] = nil
+		}
 		data, _ := json.Marshal(toolChunk)
 		sse.writeData(string(data))
 	}
@@ -303,28 +336,14 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 		completionTokens = len(words) + cfg.ReasoningTokens
 	}
 
-	// Finish chunk with usage
-	streamUsage := map[string]any{
-		"prompt_tokens":     promptTokens,
-		"completion_tokens": completionTokens,
-		"total_tokens":      promptTokens + completionTokens,
-	}
-	if cfg.ReasoningTokens > 0 {
-		streamUsage["completion_tokens_details"] = map[string]any{
-			"reasoning_tokens":           cfg.ReasoningTokens,
-			"accepted_prediction_tokens": 0,
-			"rejected_prediction_tokens": 0,
-		}
-		streamUsage["prompt_tokens_details"] = map[string]any{
-			"cached_tokens": 0,
-		}
-	}
+	// Finish chunk
 	finishChunk := map[string]any{
 		"id":                 id,
 		"object":             "chat.completion.chunk",
 		"created":            time.Now().Unix(),
 		"model":              model,
 		"system_fingerprint": "fp_mock",
+		"service_tier":       "default",
 		"choices": []map[string]any{
 			{
 				"index":         0,
@@ -333,10 +352,30 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 				"finish_reason": openaiFinishReason(cfg),
 			},
 		},
-		"usage": streamUsage,
+	}
+	if cfg.LegacyStreamUsage {
+		finishChunk["usage"] = openaiUsage(cfg, promptTokens, completionTokens)
+	} else if includeUsage {
+		finishChunk["usage"] = nil
 	}
 	data, _ = json.Marshal(finishChunk)
 	sse.writeData(string(data))
+
+	// Trailing usage chunk: empty choices carrying the totals.
+	if usageNullOnChunks {
+		usageChunk := map[string]any{
+			"id":                 id,
+			"object":             "chat.completion.chunk",
+			"created":            time.Now().Unix(),
+			"model":              model,
+			"system_fingerprint": "fp_mock",
+			"service_tier":       "default",
+			"choices":            []any{},
+			"usage":              openaiUsage(cfg, promptTokens, completionTokens),
+		}
+		data, _ = json.Marshal(usageChunk)
+		sse.writeData(string(data))
+	}
 
 	sse.writeDone()
 }

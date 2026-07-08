@@ -492,6 +492,7 @@ func TestDeterministicAnthropicStreamPreset(t *testing.T) {
 	// Verify full event sequence
 	expectedEvents := []string{
 		"message_start",
+		"ping",
 		"content_block_start",
 		"content_block_delta", // 3 words = 3 deltas
 		"content_block_delta",
@@ -521,7 +522,7 @@ func TestDeterministicAnthropicStreamPreset(t *testing.T) {
 
 	// Verify content deltas produce deterministic text
 	var assembled string
-	for i := 2; i <= 4; i++ {
+	for i := 3; i <= 5; i++ {
 		var delta map[string]any
 		json.Unmarshal([]byte(events[i].Data), &delta)
 		d := delta["delta"].(map[string]any)

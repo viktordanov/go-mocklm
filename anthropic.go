@@ -28,7 +28,7 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		// Max concurrent check
 		allowed, acquired := state.AcquireConcurrency("anthropic")
 		if !allowed {
-			writeErrorResponse(w, 503, "anthropic", "overloaded", "Too many concurrent requests")
+			writeErrorResponse(w, 503, "anthropic", "overloaded_error", "Too many concurrent requests")
 			return
 		}
 		if acquired {
@@ -72,7 +72,7 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 			return
 		}
 
-		if checkFaults(w, r, &cfg, limiter, "anthropic") {
+		if checkFaults(w, r, &cfg, limiter, state, "anthropic") {
 			return
 		}
 
@@ -148,10 +148,13 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 }
 
 // anthropicUsage builds the usage object with the full field set the real
-// API always sends (spec Usage.required — all nullable extras emitted as
-// null/zero like real responses, cache fields driven by config knobs).
+// API always sends: all 9 spec Usage.required keys, including the
+// required-but-nullable inference_geo and output_tokens_details (emitted as
+// null, their spec default). Cache fields are driven by config knobs. The
+// emit_nonstandard_fields fault knob adds a genuinely-unknown extra key for
+// unknown-field tolerance testing.
 func anthropicUsage(cfg *ProviderConfig, inputTokens, outputTokens int) map[string]any {
-	return map[string]any{
+	u := map[string]any{
 		"input_tokens":                inputTokens,
 		"output_tokens":               outputTokens,
 		"cache_read_input_tokens":     cfg.CacheReadTokens,
@@ -165,6 +168,10 @@ func anthropicUsage(cfg *ProviderConfig, inputTokens, outputTokens int) map[stri
 		"inference_geo":         nil,
 		"output_tokens_details": nil,
 	}
+	if cfg.EmitNonstandardFields {
+		u["x_mock_unknown_usage_field"] = 0
+	}
+	return u
 }
 
 // anthropicStopReason resolves the stop_reason to emit: explicit config
@@ -198,6 +205,9 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 			"stop_details":  nil,
 			"container":     nil,
 			"usage":         anthropicUsage(cfg, inputTokens, outputTokens),
+		}
+		if cfg.EmitNonstandardFields {
+			resp["x_mock_unknown_field"] = "unknown-field-tolerance-probe"
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -239,6 +249,9 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 		"container":     nil,
 		"usage":         anthropicUsage(cfg, inputTokens, outputTokens),
 	}
+	if cfg.EmitNonstandardFields {
+		resp["x_mock_unknown_field"] = "unknown-field-tolerance-probe"
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -247,29 +260,55 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
 	sse := newSSEWriter(w)
 
+	// emit writes one SSE event and applies the disconnect_after_event
+	// fault: when the just-written event type matches the knob, the
+	// connection is cut (RST) and the handler must stop.
+	emit := func(event, data string) bool {
+		sse.writeEvent(event, data)
+		if cfg.DisconnectAfterEvent != "" && cfg.DisconnectAfterEvent == event {
+			hijackAndClose(w)
+			return true
+		}
+		return false
+	}
+
 	// TTFT delay
 	if cfg.TtftMs > 0 {
 		sleepWithPings(sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs)
 	}
 
 	// message_start
-	startUsage := anthropicUsage(cfg, inputTokens, 1)
+	startMsg := map[string]any{
+		"id":            id,
+		"type":          "message",
+		"role":          "assistant",
+		"content":       []any{},
+		"model":         model,
+		"stop_reason":   nil,
+		"stop_sequence": nil,
+		"stop_details":  nil,
+		"container":     nil,
+		"usage":         anthropicUsage(cfg, inputTokens, 1),
+	}
+	if cfg.EmitNonstandardFields {
+		startMsg["x_mock_unknown_field"] = "unknown-field-tolerance-probe"
+	}
 	msgStart, _ := json.Marshal(map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id":            id,
-			"type":          "message",
-			"role":          "assistant",
-			"content":       []any{},
-			"model":         model,
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"stop_details":  nil,
-			"container":     nil,
-			"usage":         startUsage,
-		},
+		"type":    "message_start",
+		"message": startMsg,
 	})
-	sse.writeEvent("message_start", string(msgStart))
+	if emit("message_start", string(msgStart)) {
+		return
+	}
+
+	// Typed ping event right after message_start, like the real API. Not a
+	// MessageStreamEvent union member in the pinned spec, so it can be
+	// suppressed for strict schema-validation harnesses.
+	if !cfg.SuppressPingEvents {
+		if emit("ping", `{"type":"ping"}`) {
+			return
+		}
+	}
 
 	textBlockIndex := 0
 
@@ -289,7 +328,9 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 				"type": "thinking", "thinking": "", "signature": "",
 			},
 		})
-		sse.writeEvent("content_block_start", string(thinkStart))
+		if emit("content_block_start", string(thinkStart)) {
+			return
+		}
 
 		// Stream thinking in ~5 word chunks
 		for i := 0; i < len(thinkingWords); i += 5 {
@@ -322,7 +363,9 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 					"thinking": chunk,
 				},
 			})
-			sse.writeEvent("content_block_delta", string(thinkDelta))
+			if emit("content_block_delta", string(thinkDelta)) {
+				return
+			}
 		}
 
 		// signature_delta closes the thinking block like the real API
@@ -334,14 +377,18 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 				"signature": "sig_mock",
 			},
 		})
-		sse.writeEvent("content_block_delta", string(sigDelta))
+		if emit("content_block_delta", string(sigDelta)) {
+			return
+		}
 
 		// content_block_stop for thinking
 		thinkStop, _ := json.Marshal(map[string]any{
 			"type":  "content_block_stop",
 			"index": 0,
 		})
-		sse.writeEvent("content_block_stop", string(thinkStop))
+		if emit("content_block_stop", string(thinkStop)) {
+			return
+		}
 
 		textBlockIndex = 1
 	}
@@ -352,7 +399,9 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 		"index":         textBlockIndex,
 		"content_block": map[string]any{"type": "text", "text": "", "citations": nil},
 	})
-	sse.writeEvent("content_block_start", string(blockStart))
+	if emit("content_block_start", string(blockStart)) {
+		return
+	}
 
 	// content_block_delta (word by word)
 	for i, word := range words {
@@ -390,7 +439,9 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 				"text": token,
 			},
 		})
-		sse.writeEvent("content_block_delta", string(delta))
+		if emit("content_block_delta", string(delta)) {
+			return
+		}
 	}
 
 	// content_block_stop for text
@@ -398,7 +449,9 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 		"type":  "content_block_stop",
 		"index": textBlockIndex,
 	})
-	sse.writeEvent("content_block_stop", string(blockStop))
+	if emit("content_block_stop", string(blockStop)) {
+		return
+	}
 
 	// Tool use block: content_block_start + input_json_delta fragments +
 	// content_block_stop, like the real API streams tool calls.
@@ -416,7 +469,9 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 				"caller": map[string]any{"type": "direct"},
 			},
 		})
-		sse.writeEvent("content_block_start", string(toolStart))
+		if emit("content_block_start", string(toolStart)) {
+			return
+		}
 
 		inputJSON, _ := json.Marshal(toolInput)
 		for _, fragment := range splitJSONFragments(string(inputJSON), 3) {
@@ -428,43 +483,56 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 					"partial_json": fragment,
 				},
 			})
-			sse.writeEvent("content_block_delta", string(toolDelta))
+			if emit("content_block_delta", string(toolDelta)) {
+				return
+			}
 		}
 
 		toolStop, _ := json.Marshal(map[string]any{
 			"type":  "content_block_stop",
 			"index": toolBlockIndex,
 		})
-		sse.writeEvent("content_block_stop", string(toolStop))
+		if emit("content_block_stop", string(toolStop)) {
+			return
+		}
 	}
 
 	// message_delta — full MessageDelta + MessageDeltaUsage shapes per the
-	// spec (delta carries container/stop_details; usage carries the full
-	// required set, input_tokens included).
+	// spec: delta carries container and the required-nullable stop_details;
+	// usage carries the full MessageDeltaUsage.required set including the
+	// required-nullable output_tokens_details.
+	deltaObj := map[string]any{
+		"stop_reason":   anthropicStopReason(cfg),
+		"stop_sequence": nil,
+		"stop_details":  nil,
+		"container":     nil,
+	}
+	deltaUsage := map[string]any{
+		"input_tokens":                inputTokens,
+		"output_tokens":               outputTokens,
+		"cache_read_input_tokens":     cfg.CacheReadTokens,
+		"cache_creation_input_tokens": cfg.CacheCreationTokens,
+		"server_tool_use":             nil,
+		"output_tokens_details":       nil,
+	}
+	if cfg.EmitNonstandardFields {
+		deltaObj["x_mock_unknown_field"] = "unknown-field-tolerance-probe"
+		deltaUsage["x_mock_unknown_usage_field"] = 0
+	}
 	msgDelta, _ := json.Marshal(map[string]any{
-		"type": "message_delta",
-		"delta": map[string]any{
-			"stop_reason":   anthropicStopReason(cfg),
-			"stop_sequence": nil,
-			"container":     nil,
-			"stop_details":  nil,
-		},
-		"usage": map[string]any{
-			"input_tokens":                inputTokens,
-			"output_tokens":               outputTokens,
-			"cache_read_input_tokens":     cfg.CacheReadTokens,
-			"cache_creation_input_tokens": cfg.CacheCreationTokens,
-			"output_tokens_details":       nil,
-			"server_tool_use":             nil,
-		},
+		"type":  "message_delta",
+		"delta": deltaObj,
+		"usage": deltaUsage,
 	})
-	sse.writeEvent("message_delta", string(msgDelta))
+	if emit("message_delta", string(msgDelta)) {
+		return
+	}
 
 	// message_stop
 	msgStop, _ := json.Marshal(map[string]any{
 		"type": "message_stop",
 	})
-	sse.writeEvent("message_stop", string(msgStop))
+	emit("message_stop", string(msgStop))
 }
 
 // splitJSONFragments splits a JSON string into n roughly equal pieces for

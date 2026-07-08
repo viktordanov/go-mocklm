@@ -18,7 +18,7 @@ func handleOpenAICompletions(state *ServerState) http.HandlerFunc {
 
 		allowed, acquired := state.AcquireConcurrency("openai")
 		if !allowed {
-			writeErrorResponse(w, 503, "openai", "overloaded", "Too many concurrent requests")
+			writeErrorResponse(w, 503, "openai", "server_error", "Too many concurrent requests")
 			return
 		}
 		if acquired {
@@ -54,7 +54,7 @@ func handleOpenAICompletions(state *ServerState) http.HandlerFunc {
 			return
 		}
 
-		if checkFaults(w, r, &cfg, limiter, "openai") {
+		if checkFaults(w, r, &cfg, limiter, state, "openai") {
 			return
 		}
 

@@ -35,6 +35,11 @@ type ServerState struct {
 	// Concurrency tracking
 	openaiActive    atomic.Int32
 	anthropicActive atomic.Int32
+
+	// fail_first_n request counters (per provider); reset on Update/Reset
+	// so a fresh fault config starts counting from zero.
+	openaiFailSeq    atomic.Int64
+	anthropicFailSeq atomic.Int64
 }
 
 // NewServerState creates a ServerState from the initial config and builds rate limiters.
@@ -81,6 +86,7 @@ func (s *ServerState) Update(openai, anthropic ProviderConfig, presetName string
 	s.cfg.Anthropic = anthropic
 	s.activePreset = presetName
 	s.rebuildLimiters()
+	s.resetFailSeqs()
 }
 
 // Reset restores the initial startup config.
@@ -92,6 +98,21 @@ func (s *ServerState) Reset() {
 	s.cfg.Anthropic = s.initialCfg.Anthropic
 	s.activePreset = ""
 	s.rebuildLimiters()
+	s.resetFailSeqs()
+}
+
+// NextFailSeq returns the 1-based sequence number of this request for the
+// provider's fail_first_n counter.
+func (s *ServerState) NextFailSeq(provider string) int64 {
+	if provider == "openai" {
+		return s.openaiFailSeq.Add(1)
+	}
+	return s.anthropicFailSeq.Add(1)
+}
+
+func (s *ServerState) resetFailSeqs() {
+	s.openaiFailSeq.Store(0)
+	s.anthropicFailSeq.Store(0)
 }
 
 // maxRecordedRequests caps the in-memory recording buffer; the oldest

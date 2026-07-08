@@ -41,11 +41,41 @@ type ProviderConfig struct {
 	// unknown top-level fields, missing required fields, and out-of-range
 	// values are rejected with 400 like the real API (strict.go).
 	Strict bool `toml:"strict" json:"strict"`
-	// CacheReadTokens / CacheCreationTokens add Anthropic prompt-cache usage
-	// fields (cache_read_input_tokens / cache_creation_input_tokens) to
-	// responses when > 0.
+	// CacheReadTokens / CacheCreationTokens drive prompt-cache usage fields:
+	// Anthropic cache_read_input_tokens / cache_creation_input_tokens, and
+	// OpenAI prompt_tokens_details.cached_tokens.
 	CacheReadTokens     int `toml:"cache_read_tokens" json:"cache_read_tokens"`
 	CacheCreationTokens int `toml:"cache_creation_tokens" json:"cache_creation_tokens"`
+	// FailFirstN deterministically fails the first N requests seen by the
+	// provider (with error_status), then succeeds. The counter resets on
+	// config update/reset. Deterministic alternative to error_rate.
+	FailFirstN int `toml:"fail_first_n" json:"fail_first_n"`
+	// DisconnectAfterEvent cuts the Anthropic stream (TCP RST) immediately
+	// after writing the named SSE event type, e.g. "message_delta" leaves
+	// the client with a stop_reason but no message_stop, and
+	// "content_block_start" cuts before any delta arrives.
+	DisconnectAfterEvent string `toml:"disconnect_after_event" json:"disconnect_after_event"`
+	// EmitNonstandardFields injects genuinely-unknown fields that are NOT in
+	// the pinned Anthropic spec (x_mock_unknown_field on message shapes and
+	// message_delta.delta, x_mock_unknown_usage_field on usage objects) as a
+	// deliberate unknown-field-tolerance fault. Off by default: responses
+	// carry only spec fields. Note the spec-required nullable fields
+	// (stop_details, usage.inference_geo, usage.output_tokens_details) are
+	// always emitted — they are part of Message.required / Usage.required in
+	// nanollm's pinned spec, not fabrications.
+	EmitNonstandardFields bool `toml:"emit_nonstandard_fields" json:"emit_nonstandard_fields"`
+	// SuppressPingEvents omits the typed Anthropic ping event after
+	// message_start. The real API sends it (and it is emitted by default),
+	// but the pinned spec's MessageStreamEvent union has no ping arm — a
+	// validator checking every data: payload against that union needs either
+	// a ping exception or this knob.
+	SuppressPingEvents bool `toml:"suppress_ping_events" json:"suppress_ping_events"`
+	// LegacyStreamUsage restores the pre-fidelity OpenAI streaming usage
+	// shape: usage rides the finish chunk unconditionally and
+	// stream_options.include_usage is ignored. Off by default: the real API
+	// shape (usage: null on chunks + trailing choices:[] usage chunk, only
+	// when include_usage is requested) is emitted.
+	LegacyStreamUsage bool `toml:"legacy_stream_usage" json:"legacy_stream_usage"`
 }
 
 type Config struct {
