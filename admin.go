@@ -29,7 +29,7 @@ func handleAdminPutConfig(state *ServerState) http.HandlerFunc {
 			Anthropic ProviderConfig `json:"anthropic"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeErrorResponse(w, 400, "admin", "invalid_request_error", "Invalid JSON: "+err.Error())
+			writeErrorResponse(w, nil, 400, "admin", "invalid_request_error", "Invalid JSON: "+err.Error())
 			return
 		}
 
@@ -54,7 +54,7 @@ func handleAdminPutPreset(state *ServerState) http.HandlerFunc {
 
 		preset, ok := presets[name]
 		if !ok {
-			writeErrorResponse(w, 404, "admin", "not_found", "Unknown preset: "+name)
+			writeErrorResponse(w, nil, 404, "admin", "not_found", "Unknown preset: "+name)
 			return
 		}
 

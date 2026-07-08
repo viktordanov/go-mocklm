@@ -18,7 +18,7 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		// Max concurrent check
 		allowed, acquired := state.AcquireConcurrency("openai")
 		if !allowed {
-			writeErrorResponse(w, 503, "openai", "server_error", "Too many concurrent requests")
+			writeErrorResponse(w, &cfg, 503, "openai", "server_error", "Too many concurrent requests")
 			return
 		}
 		if acquired {
@@ -28,7 +28,7 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		// Buffer body for recording
 		rawBody, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Failed to read body: "+err.Error())
+			writeErrorResponse(w, &cfg, 400, "openai", "invalid_request_error", "Failed to read body: "+err.Error())
 			return
 		}
 
@@ -57,7 +57,7 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 			} `json:"stream_options"`
 		}
 		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
-			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
+			writeErrorResponse(w, &cfg, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
 			return
 		}
 
@@ -72,7 +72,7 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		// Resolve output tokens: header > body > config
 		outputTokens, err := resolveTokenCount(r, &cfg, req.MaxTokens)
 		if err != nil {
-			writeErrorResponse(w, 400, "openai", "invalid_request_error", err.Error())
+			writeErrorResponse(w, &cfg, 400, "openai", "invalid_request_error", err.Error())
 			return
 		}
 
@@ -204,12 +204,28 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 		"usage": usage,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeValidatedJSON(w, cfg, kindOpenAIChat, "openai chat completion", resp)
 }
 
 func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any, includeUsage bool) {
 	sse := newSSEWriter(w)
+	validate := shouldValidate(cfg) && !bypassesValidation(cfg)
+
+	// emitChunk validates each data payload against the pinned
+	// CreateChatCompletionStreamResponse root when validate_responses is on
+	// (a violation severs the stream), then writes the SSE frame. Returns
+	// false when the stream must abort.
+	emitChunk := func(chunk map[string]any) bool {
+		data, _ := json.Marshal(chunk)
+		if validate {
+			if err := validateEmittedBody(kindOpenAIChunk, data); err != nil {
+				failStreamValidation(w, "openai stream chunk", data, err)
+				return false
+			}
+		}
+		sse.writeData(string(data))
+		return true
+	}
 
 	// Streaming usage shape (real API): usage appears only when the request
 	// set stream_options.include_usage — "usage": null on every chunk, then
@@ -246,8 +262,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 	if usageNullOnChunks {
 		roleChunk["usage"] = nil
 	}
-	data, _ := json.Marshal(roleChunk)
-	sse.writeData(string(data))
+	if !emitChunk(roleChunk) {
+		return
+	}
 
 	// Content chunks
 	for i, word := range words {
@@ -299,8 +316,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 		if usageNullOnChunks {
 			contentChunk["usage"] = nil
 		}
-		data, _ := json.Marshal(contentChunk)
-		sse.writeData(string(data))
+		if !emitChunk(contentChunk) {
+			return
+		}
 	}
 
 	// Tool call delta: a single chunk carrying the full call (valid per the
@@ -327,8 +345,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 		if usageNullOnChunks {
 			toolChunk["usage"] = nil
 		}
-		data, _ := json.Marshal(toolChunk)
-		sse.writeData(string(data))
+		if !emitChunk(toolChunk) {
+			return
+		}
 	}
 
 	// Adjust completion tokens for reasoning
@@ -358,8 +377,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 	} else if includeUsage {
 		finishChunk["usage"] = nil
 	}
-	data, _ = json.Marshal(finishChunk)
-	sse.writeData(string(data))
+	if !emitChunk(finishChunk) {
+		return
+	}
 
 	// Trailing usage chunk: empty choices carrying the totals.
 	if usageNullOnChunks {
@@ -373,8 +393,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 			"choices":            []any{},
 			"usage":              openaiUsage(cfg, promptTokens, completionTokens),
 		}
-		data, _ = json.Marshal(usageChunk)
-		sse.writeData(string(data))
+		if !emitChunk(usageChunk) {
+			return
+		}
 	}
 
 	sse.writeDone()

@@ -13,22 +13,22 @@ import (
 
 func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		cfg, limiter := state.Anthropic()
+
 		// Validate required headers
 		if r.Header.Get("x-api-key") == "" {
-			writeErrorResponse(w, 401, "anthropic", "authentication_error", "Missing x-api-key header")
+			writeErrorResponse(w, &cfg, 401, "anthropic", "authentication_error", "Missing x-api-key header")
 			return
 		}
 		if r.Header.Get("anthropic-version") == "" {
-			writeErrorResponse(w, 401, "anthropic", "authentication_error", "Missing anthropic-version header")
+			writeErrorResponse(w, &cfg, 401, "anthropic", "authentication_error", "Missing anthropic-version header")
 			return
 		}
-
-		cfg, limiter := state.Anthropic()
 
 		// Max concurrent check
 		allowed, acquired := state.AcquireConcurrency("anthropic")
 		if !allowed {
-			writeErrorResponse(w, 503, "anthropic", "overloaded_error", "Too many concurrent requests")
+			writeErrorResponse(w, &cfg, 503, "anthropic", "overloaded_error", "Too many concurrent requests")
 			return
 		}
 		if acquired {
@@ -38,7 +38,7 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		// Capture raw body for request recording
 		rawBody, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeErrorResponse(w, 400, "anthropic", "invalid_request_error", "Failed to read body: "+err.Error())
+			writeErrorResponse(w, &cfg, 400, "anthropic", "invalid_request_error", "Failed to read body: "+err.Error())
 			return
 		}
 
@@ -68,7 +68,7 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 			} `json:"thinking"`
 		}
 		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
-			writeErrorResponse(w, 400, "anthropic", "invalid_request_error", "Invalid JSON: "+err.Error())
+			writeErrorResponse(w, &cfg, 400, "anthropic", "invalid_request_error", "Invalid JSON: "+err.Error())
 			return
 		}
 
@@ -80,7 +80,7 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		// request schema (after fault injection, like a real gateway).
 		if cfg.Strict {
 			if msg := validateAnthropicStrict(rawBody); msg != "" {
-				writeErrorResponse(w, 400, "anthropic", "invalid_request_error", msg)
+				writeErrorResponse(w, &cfg, 400, "anthropic", "invalid_request_error", msg)
 				return
 			}
 		}
@@ -117,7 +117,7 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		// Resolve output tokens: header > body > config
 		outputTokens, err := resolveTokenCount(r, &cfg, req.MaxTokens)
 		if err != nil {
-			writeErrorResponse(w, 400, "anthropic", "invalid_request_error", err.Error())
+			writeErrorResponse(w, &cfg, 400, "anthropic", "invalid_request_error", err.Error())
 			return
 		}
 
@@ -209,8 +209,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 		if cfg.EmitNonstandardFields {
 			resp["x_mock_unknown_field"] = "unknown-field-tolerance-probe"
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		writeValidatedJSON(w, cfg, kindAnthropicMessage, "anthropic tool-use message", resp)
 		return
 	}
 
@@ -253,17 +252,26 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 		resp["x_mock_unknown_field"] = "unknown-field-tolerance-probe"
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeValidatedJSON(w, cfg, kindAnthropicMessage, "anthropic message", resp)
 }
 
 func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
 	sse := newSSEWriter(w)
+	validate := shouldValidate(cfg) && !bypassesValidation(cfg)
 
-	// emit writes one SSE event and applies the disconnect_after_event
-	// fault: when the just-written event type matches the knob, the
-	// connection is cut (RST) and the handler must stop.
+	// emit validates the SSE data payload against the pinned
+	// MessageStreamEvent union (ping via the local arm) when
+	// validate_responses is on — a violation severs the stream — then
+	// writes the event and applies the disconnect_after_event fault: when
+	// the just-written event type matches the knob, the connection is cut
+	// (RST) and the handler must stop.
 	emit := func(event, data string) bool {
+		if validate {
+			if err := validateEmittedBody(kindAnthropicEvent, []byte(data)); err != nil {
+				failStreamValidation(w, "anthropic stream event "+event, []byte(data), err)
+				return true
+			}
+		}
 		sse.writeEvent(event, data)
 		if cfg.DisconnectAfterEvent != "" && cfg.DisconnectAfterEvent == event {
 			hijackAndClose(w)

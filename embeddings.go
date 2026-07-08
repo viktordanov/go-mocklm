@@ -17,7 +17,7 @@ func handleOpenAIEmbeddings(state *ServerState) http.HandlerFunc {
 
 		allowed, acquired := state.AcquireConcurrency("openai")
 		if !allowed {
-			writeErrorResponse(w, 503, "openai", "server_error", "Too many concurrent requests")
+			writeErrorResponse(w, &cfg, 503, "openai", "server_error", "Too many concurrent requests")
 			return
 		}
 		if acquired {
@@ -26,7 +26,7 @@ func handleOpenAIEmbeddings(state *ServerState) http.HandlerFunc {
 
 		rawBody, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Failed to read body: "+err.Error())
+			writeErrorResponse(w, &cfg, 400, "openai", "invalid_request_error", "Failed to read body: "+err.Error())
 			return
 		}
 
@@ -48,7 +48,7 @@ func handleOpenAIEmbeddings(state *ServerState) http.HandlerFunc {
 			Input json.RawMessage `json:"input"`
 		}
 		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
-			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
+			writeErrorResponse(w, &cfg, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
 			return
 		}
 

@@ -17,7 +17,7 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 		// Max concurrent check
 		allowed, acquired := state.AcquireConcurrency("openai")
 		if !allowed {
-			writeErrorResponse(w, 503, "openai", "server_error", "Too many concurrent requests")
+			writeErrorResponse(w, &cfg, 503, "openai", "server_error", "Too many concurrent requests")
 			return
 		}
 		if acquired {
@@ -27,7 +27,7 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 		// Buffer body for recording
 		rawBody, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Failed to read body: "+err.Error())
+			writeErrorResponse(w, &cfg, 400, "openai", "invalid_request_error", "Failed to read body: "+err.Error())
 			return
 		}
 
@@ -55,7 +55,7 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 			} `json:"input"`
 		}
 		if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
-			writeErrorResponse(w, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
+			writeErrorResponse(w, &cfg, 400, "openai", "invalid_request_error", "Invalid JSON: "+err.Error())
 			return
 		}
 
@@ -70,7 +70,7 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 		// Resolve output tokens: header > body > config
 		outputTokens, err := resolveTokenCount(r, &cfg, req.MaxOutputTokens)
 		if err != nil {
-			writeErrorResponse(w, 400, "openai", "invalid_request_error", err.Error())
+			writeErrorResponse(w, &cfg, 400, "openai", "invalid_request_error", err.Error())
 			return
 		}
 

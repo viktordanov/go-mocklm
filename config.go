@@ -13,26 +13,26 @@ type ServerConfig struct {
 }
 
 type ProviderConfig struct {
-	LatencyMs             int     `toml:"latency_ms" json:"latency_ms"`
-	Tokens                int     `toml:"tokens" json:"tokens"`
-	StreamDelayMs         int     `toml:"stream_delay_ms" json:"stream_delay_ms"`
-	ErrorRate             float64 `toml:"error_rate" json:"error_rate"`
-	ErrorStatus           int     `toml:"error_status" json:"error_status"`
-	TimeoutMs             int     `toml:"timeout_ms" json:"timeout_ms"`
-	DisconnectAfterChunks int     `toml:"disconnect_after_chunks" json:"disconnect_after_chunks"`
-	MalformedChunk        bool    `toml:"malformed_chunk" json:"malformed_chunk"`
-	RateLimitRPM          int     `toml:"rate_limit_rpm" json:"rate_limit_rpm"`
+	LatencyMs              int     `toml:"latency_ms" json:"latency_ms"`
+	Tokens                 int     `toml:"tokens" json:"tokens"`
+	StreamDelayMs          int     `toml:"stream_delay_ms" json:"stream_delay_ms"`
+	ErrorRate              float64 `toml:"error_rate" json:"error_rate"`
+	ErrorStatus            int     `toml:"error_status" json:"error_status"`
+	TimeoutMs              int     `toml:"timeout_ms" json:"timeout_ms"`
+	DisconnectAfterChunks  int     `toml:"disconnect_after_chunks" json:"disconnect_after_chunks"`
+	MalformedChunk         bool    `toml:"malformed_chunk" json:"malformed_chunk"`
+	RateLimitRPM           int     `toml:"rate_limit_rpm" json:"rate_limit_rpm"`
 	ReasoningTokens        int     `toml:"reasoning_tokens" json:"reasoning_tokens"`
 	ThinkingDelayMs        int     `toml:"thinking_delay_ms" json:"thinking_delay_ms"`
 	Deterministic          bool    `toml:"deterministic" json:"deterministic"`
 	ToolUseResponse        bool    `toml:"tool_use_response" json:"tool_use_response"`
-	HonorMaxTokens         bool   `toml:"honor_max_tokens" json:"honor_max_tokens"`
-	MinTokens              int    `toml:"min_tokens" json:"min_tokens"`
-	TtftMs                 int    `toml:"ttft_ms" json:"ttft_ms"`
-	StreamDelayJitterMs    int    `toml:"stream_delay_jitter_ms" json:"stream_delay_jitter_ms"`
-	SlowHeaderMs           int    `toml:"slow_header_ms" json:"slow_header_ms"`
-	MaxConcurrent          int    `toml:"max_concurrent" json:"max_concurrent"`
-	SseKeepaliveIntervalMs int    `toml:"sse_keepalive_interval_ms" json:"sse_keepalive_interval_ms"`
+	HonorMaxTokens         bool    `toml:"honor_max_tokens" json:"honor_max_tokens"`
+	MinTokens              int     `toml:"min_tokens" json:"min_tokens"`
+	TtftMs                 int     `toml:"ttft_ms" json:"ttft_ms"`
+	StreamDelayJitterMs    int     `toml:"stream_delay_jitter_ms" json:"stream_delay_jitter_ms"`
+	SlowHeaderMs           int     `toml:"slow_header_ms" json:"slow_header_ms"`
+	MaxConcurrent          int     `toml:"max_concurrent" json:"max_concurrent"`
+	SseKeepaliveIntervalMs int     `toml:"sse_keepalive_interval_ms" json:"sse_keepalive_interval_ms"`
 	// StopReason overrides the emitted stop reason. Anthropic responses use
 	// it for stop_reason (e.g. "pause_turn", "refusal"); OpenAI responses
 	// use it for finish_reason (e.g. "content_filter"). Empty = default.
@@ -76,6 +76,22 @@ type ProviderConfig struct {
 	// shape (usage: null on chunks + trailing choices:[] usage chunk, only
 	// when include_usage is requested) is emitted.
 	LegacyStreamUsage bool `toml:"legacy_stream_usage" json:"legacy_stream_usage"`
+	// ValidateResponses checks the bodies covered by the vendored
+	// response-side closure of nanollm's pinned specs before writing them
+	// (validator.go): OpenAI chat-completion and Anthropic messages bodies
+	// (non-stream responses and each SSE data payload) plus provider error
+	// envelopes on every endpoint. Success bodies of /v1/completions,
+	// /v1/embeddings, /v1/responses, and /v1/models are outside the
+	// extracted closure and are NOT validated. Violations fail loudly: 500
+	// before headers, RST mid-stream, or panic with MOCKLM_VALIDATE_PANIC.
+	// Tri-state: unset defers to the MOCKLM_VALIDATE_RESPONSES env
+	// default, so a harness can force it on globally while a
+	// deliberate-fault request opts out with X-MockLM-Fault
+	// {"validate_responses": false}. Deliberately-off-spec output
+	// (malformed_chunk, emit_nonstandard_fields) bypasses validation by
+	// design. The typed ping event validates against a local ping arm,
+	// since the pinned MessageStreamEvent union has none.
+	ValidateResponses *bool `toml:"validate_responses" json:"validate_responses,omitempty"`
 }
 
 type Config struct {

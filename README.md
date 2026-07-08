@@ -151,8 +151,9 @@ thinking_delay_ms = 0
 | `fail_first_n` | int | 0 | Deterministically fail the first N requests (per provider) with `error_status`, then succeed. Counter resets on config update/reset. Deterministic alternative to `error_rate` |
 | `disconnect_after_event` | string | "" | Anthropic streaming: TCP RST immediately after the named SSE event type is written (e.g. `message_delta` leaves a stop_reason but no `message_stop`; `content_block_start` cuts before any delta) |
 | `emit_nonstandard_fields` | bool | false | Inject genuinely-unknown probe fields (`x_mock_unknown_field` on Anthropic message shapes / `message_delta.delta`, `x_mock_unknown_usage_field` on usage) as an unknown-field-tolerance fault. Spec-required nullable fields (`stop_details`, `usage.inference_geo`, `usage.output_tokens_details`) are always emitted regardless — they are in the pinned spec's `Message.required`/`Usage.required` |
-| `suppress_ping_events` | bool | false | Anthropic streaming: omit the typed `ping` event after `message_start`. The real API sends it, but the pinned spec's `MessageStreamEvent` union has no ping arm — use this for strict schema-validation harnesses |
+| `suppress_ping_events` | bool | false | Anthropic streaming: omit the typed `ping` event after `message_start`. The real API sends it, but the pinned spec's `MessageStreamEvent` union has no ping arm — the built-in validator handles it via a local ping arm, so this knob is only needed for external strict-validation harnesses |
 | `legacy_stream_usage` | bool | false | OpenAI streaming: restore the old mock usage shape (usage rides the finish chunk unconditionally, `stream_options.include_usage` ignored). Default emits the real API shape |
+| `validate_responses` | bool? | unset | Self-validation of the surfaces covered by the vendored closure of nanollm's pinned specs: OpenAI chat-completion and Anthropic messages bodies (non-stream + each SSE `data:` payload) and provider error envelopes on every endpoint, checked before writing (see [Spec-Sync & Response Validation](#spec-sync--response-validation) — `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/models` success bodies are outside the closure and not validated). Tri-state: unset defers to the `MOCKLM_VALIDATE_RESPONSES` env default; explicit `false` (e.g. via `X-MockLM-Fault`) opts a deliberate-fault request out |
 
 ## Request Fidelity
 
@@ -450,6 +451,69 @@ event: response.output_item.done
 event: response.completed
 ```
 
+## Spec-Sync & Response Validation
+
+go-mocklm vendors the **response-side JSON-Schema closure** of the same
+sha256-pinned OpenAPI specs nanollm's Rust oracle types are generated from
+(`../nanollm/spec/*.json`):
+
+- `spec/openai-responses.schema.json` — 13 schemas reachable from
+  `CreateChatCompletionResponse`, `CreateChatCompletionStreamResponse`,
+  `ErrorResponse`
+- `spec/anthropic-responses.schema.json` — 82 schemas reachable from
+  `Message`, `MessageStreamEvent`, `ErrorResponse`
+- `spec/pins.json` — sha256 of the source specs at extraction time
+
+Regenerate with `go run ./cmd/specsync` (or `go generate ./...`). The
+extractor ports exactly two normalization rules from nanollm's
+`xtask/src/main.rs`: the OpenAI `nullable: true` → null-union rewrite
+(plus a null `enum` value where an enum co-resides, since `enum` asserts
+independently under real validation), and `additionalProperties: false`
+injection on the two OpenAI response roots (without it, OpenAI response
+validation is unknown-field-blind). `spec_sync_test.go` fails when the
+recorded pins diverge from `../nanollm/spec` or when the vendored files
+drift from a fresh extraction.
+
+With `validate_responses` on (knob or `MOCKLM_VALIDATE_RESPONSES=1` env
+default), every body on the closure's surfaces is validated (full JSON
+Schema 2020-12 via `santhosh-tekuri/jsonschema`) before writing:
+
+| Surface | Schema root |
+|---|---|
+| OpenAI chat non-stream | `CreateChatCompletionResponse` |
+| OpenAI chat SSE payloads (except `[DONE]`) | `CreateChatCompletionStreamResponse` |
+| Anthropic non-stream | `Message` |
+| Anthropic SSE payloads | `MessageStreamEvent` (typed `ping` via a local hand-written arm) |
+| Error envelopes, incl. injected faults | provider `ErrorResponse` |
+
+Violations fail loudly: **500** with a spec-shaped `api_error`/`server_error`
+envelope before headers, **TCP RST** mid-stream (the violating frame never
+reaches the wire), or **panic** when `MOCKLM_VALIDATE_PANIC=1`. Deliberately
+off-spec output bypasses validation by design: `malformed_chunk` frames,
+`emit_nonstandard_fields` probe bodies, and any request opted out with
+`X-MockLM-Fault: {"validate_responses": false}`.
+
+**Not validated** (success bodies outside the extracted closure — the
+closure roots mirror nanollm's oracle roots, which never covered these
+surfaces): legacy `/v1/completions`, `/v1/embeddings`, `/v1/responses`,
+and `/v1/models`. Their error envelopes ARE validated. Extending coverage
+would first require fixing the known shape drift on those surfaces
+(proposal G5/G6/G7 — Responses API completion is explicitly deferred to
+nanollm's R5 work).
+
+The runtime accept/reject surface intentionally differs from nanollm's
+generated Rust deserializers in three documented ways: spec `pattern`
+assertions are retained (typify strips them, so the validator is stricter
+there); the typed `ping` event is accepted via the local arm (the pinned
+`MessageStreamEvent` union rejects it); and `nullable: true` enums gain a
+`null` enum value (typify instead renders `Option<Enum>`, but `enum`
+asserts independently under real JSON-Schema validation). Same pinned
+bytes, same roots, deliberate deltas.
+
+Event *ordering* (message_start → content blocks → message_delta →
+message_stop) is invisible to schema validation — `contract_test.go`
+pins it with a hand-written table-driven state machine.
+
 ## Using with nanollm
 
 nanollm's integration test suite (`tests/integration.rs` + `tests/common/mod.rs`) spawns go-mocklm as a subprocess:
@@ -458,7 +522,8 @@ nanollm's integration test suite (`tests/integration.rs` + `tests/common/mod.rs`
 2. **Per-test isolation**: Each test allocates a free port, writes a temp `config.toml`, and spawns a dedicated mocklm process.
 3. **Health polling**: The harness polls `GET /health` every 50ms with a 10s deadline before proceeding.
 4. **Runtime config**: Tests call `set_preset()` or `set_config()` via the admin API to change behavior mid-test.
-5. **Cleanup**: The `Drop` impl kills the process when the test finishes.
+5. **Self-validation**: The harness sets `MOCKLM_VALIDATE_RESPONSES=1`, so every chat-completion body, messages body, and error envelope the mock emits in nanollm's integration tests is checked against the pinned-spec closure — drift on those surfaces fails loudly instead of silently distorting nanollm's coverage. (`/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/models` success bodies are outside the closure and not covered.)
+6. **Cleanup**: The `Drop` impl kills the process when the test finishes.
 
 ```bash
 # Build mocklm, then run nanollm integration tests

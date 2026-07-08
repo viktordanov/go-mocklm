@@ -125,7 +125,7 @@ func checkFaults(w http.ResponseWriter, r *http.Request, cfg *ProviderConfig, li
 	// sets also steer everything downstream of checkFaults (stream faults,
 	// stop reasons, strict mode, ...).
 	if err := applyFaultHeader(r, cfg); err != nil {
-		writeErrorResponse(w, 400, provider, "invalid_request_error", err.Error())
+		writeErrorResponse(w, cfg, 400, provider, "invalid_request_error", err.Error())
 		return true
 	}
 
@@ -134,7 +134,7 @@ func checkFaults(w http.ResponseWriter, r *http.Request, cfg *ProviderConfig, li
 		allowed, retryAfter := limiter.Allow()
 		if !allowed {
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-			writeErrorResponse(w, 429, provider, "rate_limit_error", "Rate limit exceeded. Please retry after the specified time.")
+			writeErrorResponse(w, cfg, 429, provider, "rate_limit_error", "Rate limit exceeded. Please retry after the specified time.")
 			return true
 		}
 	}
@@ -146,7 +146,7 @@ func checkFaults(w http.ResponseWriter, r *http.Request, cfg *ProviderConfig, li
 	if cfg.FailFirstN > 0 && state != nil {
 		if seq := state.NextFailSeq(provider); seq <= int64(cfg.FailFirstN) {
 			status, errType := faultErrorStatus(cfg, provider)
-			writeErrorResponse(w, status, provider, errType, fmt.Sprintf("Simulated deterministic error %d/%d (status %d)", seq, cfg.FailFirstN, status))
+			writeErrorResponse(w, cfg, status, provider, errType, fmt.Sprintf("Simulated deterministic error %d/%d (status %d)", seq, cfg.FailFirstN, status))
 			return true
 		}
 	}
@@ -154,7 +154,7 @@ func checkFaults(w http.ResponseWriter, r *http.Request, cfg *ProviderConfig, li
 	// 2b. Random error
 	if cfg.ErrorRate > 0 && rand.Float64() < cfg.ErrorRate {
 		status, errType := faultErrorStatus(cfg, provider)
-		writeErrorResponse(w, status, provider, errType, fmt.Sprintf("Simulated error (status %d)", status))
+		writeErrorResponse(w, cfg, status, provider, errType, fmt.Sprintf("Simulated error (status %d)", status))
 		return true
 	}
 
@@ -211,10 +211,12 @@ func hijackAndClose(w http.ResponseWriter) {
 // key the pinned specs require: Anthropic ErrorResponse.required is
 // {type, error, request_id}; OpenAI Error.required is
 // {type, message, param, code} (param/code nullable).
-func writeErrorResponse(w http.ResponseWriter, status int, provider, errType, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-
+//
+// When the config snapshot (nil = env default) enables validate_responses,
+// the envelope is checked against the provider's pinned ErrorResponse
+// schema before writing — injected errors are part of the contract too.
+// The "admin" pseudo-provider is not a spec surface and skips validation.
+func writeErrorResponse(w http.ResponseWriter, cfg *ProviderConfig, status int, provider, errType, message string) {
 	var body any
 	if provider == "anthropic" {
 		body = map[string]any{
@@ -236,5 +238,25 @@ func writeErrorResponse(w http.ResponseWriter, status int, provider, errType, me
 		}
 	}
 
-	json.NewEncoder(w).Encode(body)
+	data, err := marshalBody(body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if provider != "admin" && shouldValidate(cfg) {
+		kind := kindOpenAIError
+		if provider == "anthropic" {
+			kind = kindAnthropicError
+		}
+		if verr := validateEmittedBody(kind, data); verr != nil {
+			reportValidationFailure(provider+" error envelope", data, verr)
+			writeValidationFailure(w, kind, provider+" error envelope", verr)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(data)
 }
