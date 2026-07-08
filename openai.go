@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -66,7 +67,9 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		}
 
 		if cfg.ThinkingDelayMs > 0 {
-			time.Sleep(time.Duration(cfg.ThinkingDelayMs) * time.Millisecond)
+			if !waitCancelable(r.Context(), cfg.ThinkingDelayMs) {
+				return
+			}
 		}
 
 		// Resolve output tokens: header > body > config
@@ -103,12 +106,14 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 
 		// slow_header_ms delay
 		if cfg.SlowHeaderMs > 0 {
-			time.Sleep(time.Duration(cfg.SlowHeaderMs) * time.Millisecond)
+			if !waitCancelable(r.Context(), cfg.SlowHeaderMs) {
+				return
+			}
 		}
 
 		if req.Stream {
 			includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
-			handleOpenAIChatStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput, includeUsage)
+			handleOpenAIChatStream(r.Context(), w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput, includeUsage)
 		} else {
 			handleOpenAIChatNonStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput)
 		}
@@ -207,24 +212,35 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 	writeValidatedJSON(w, cfg, kindOpenAIChat, "openai chat completion", resp)
 }
 
-func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any, includeUsage bool) {
+func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any, includeUsage bool) {
 	sse := newSSEWriter(w)
 	validate := shouldValidate(cfg) && !bypassesValidation(cfg)
 
-	// emitChunk validates each data payload against the pinned
+	// writeFrame validates one data payload against the pinned
 	// CreateChatCompletionStreamResponse root when validate_responses is on
-	// (a violation severs the stream), then writes the SSE frame. Returns
-	// false when the stream must abort.
-	emitChunk := func(chunk map[string]any) bool {
-		data, _ := json.Marshal(chunk)
+	// (a violation severs the stream), then writes the SSE frame. OpenAI
+	// frames are data-only, so the injector's event name is ignored.
+	// Returns true when the stream must abort.
+	writeFrame := func(_, data string) bool {
 		if validate {
-			if err := validateEmittedBody(kindOpenAIChunk, data); err != nil {
-				failStreamValidation(w, "openai stream chunk", data, err)
-				return false
+			if err := validateEmittedBody(kindOpenAIChunk, []byte(data)); err != nil {
+				failStreamValidation(w, "openai stream chunk", []byte(data), err)
+				return true
 			}
 		}
-		sse.writeData(string(data))
-		return true
+		sse.writeData(data)
+		return false
+	}
+	inj := newStreamFaultInjector(cfg.streamFaults, w, sse, writeFrame)
+
+	// emitChunk writes one real chunk, then gives the fault injector its
+	// shot. Returns false when the stream must abort.
+	emitChunk := func(chunk map[string]any) bool {
+		data, _ := json.Marshal(chunk)
+		if writeFrame("", string(data)) {
+			return false
+		}
+		return !inj.afterFrame("")
 	}
 
 	// Streaming usage shape (real API): usage appears only when the request
@@ -236,7 +252,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 
 	// TTFT delay
 	if cfg.TtftMs > 0 {
-		sleepWithPings(sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs)
+		if !sleepWithPings(ctx, sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs) {
+			return
+		}
 	}
 
 	// Role chunk
@@ -281,7 +299,9 @@ func handleOpenAIChatStream(w http.ResponseWriter, cfg *ProviderConfig, id, mode
 			}
 		}
 		if delay > 0 {
-			sleepWithPings(sse, delay, cfg.SseKeepaliveIntervalMs)
+			if !sleepWithPings(ctx, sse, delay, cfg.SseKeepaliveIntervalMs) {
+				return
+			}
 		}
 
 		token := word
@@ -427,11 +447,12 @@ func capitalize(s string) string {
 	return strings.ToUpper(string(r[0])) + string(r[1:])
 }
 
-// sleepWithPings sleeps for totalMs, emitting SSE pings at keepaliveMs intervals.
-func sleepWithPings(sse *sseWriter, totalMs, keepaliveMs int) {
+// sleepWithPings sleeps for totalMs, emitting SSE pings at keepaliveMs
+// intervals. Cancel-aware: returns false as soon as the request context is
+// done so fault-injected slow streams cannot outlive their client.
+func sleepWithPings(ctx context.Context, sse *sseWriter, totalMs, keepaliveMs int) bool {
 	if keepaliveMs <= 0 || totalMs <= keepaliveMs {
-		time.Sleep(time.Duration(totalMs) * time.Millisecond)
-		return
+		return waitCancelable(ctx, totalMs)
 	}
 	remaining := totalMs
 	for remaining > 0 {
@@ -439,10 +460,13 @@ func sleepWithPings(sse *sseWriter, totalMs, keepaliveMs int) {
 		if chunk > remaining {
 			chunk = remaining
 		}
-		time.Sleep(time.Duration(chunk) * time.Millisecond)
+		if !waitCancelable(ctx, chunk) {
+			return false
+		}
 		remaining -= chunk
 		if remaining > 0 {
 			sse.writePing()
 		}
 	}
+	return true
 }

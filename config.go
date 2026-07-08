@@ -92,6 +92,26 @@ type ProviderConfig struct {
 	// design. The typed ping event validates against a local ping arm,
 	// since the pinned MessageStreamEvent union has none.
 	ValidateResponses *bool `toml:"validate_responses" json:"validate_responses,omitempty"`
+	// Faults is the generalized two-knob fault list (WHEN × HOW, see
+	// FaultSpec in fault.go). Every spec applies to every request, composing
+	// with the legacy knobs above. Pre-body modes fire in checkFaults;
+	// stream modes fire as the SSE stream progresses.
+	Faults []FaultSpec `toml:"faults" json:"faults,omitempty"`
+	// AttemptFaults[i] is the fault list applied only to the i-th request
+	// (0-based) seen by the provider since the last config update/reset —
+	// the request counter shared with fail_first_n and exposed at
+	// /admin/request-count. Requests past the end of the array get no
+	// attempt faults. Generalizes fail_first_n: attempt_faults =
+	// [[{"mode":"error"}], []] fails attempt 0 and lets attempt 1 succeed —
+	// the canonical retry/fallback scenario without header targeting.
+	AttemptFaults [][]FaultSpec `toml:"attempt_faults" json:"attempt_faults,omitempty"`
+
+	// streamFaults holds this request's resolved stream-phase fault specs
+	// (global faults + this attempt's attempt_faults), stashed by checkFaults
+	// on the per-request config copy so stream handlers can build their
+	// injector without re-consuming the attempt counter. Unexported: never
+	// serialized.
+	streamFaults []FaultSpec
 }
 
 type Config struct {

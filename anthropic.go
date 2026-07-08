@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -86,7 +87,9 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		}
 
 		if cfg.ThinkingDelayMs > 0 {
-			time.Sleep(time.Duration(cfg.ThinkingDelayMs) * time.Millisecond)
+			if !waitCancelable(r.Context(), cfg.ThinkingDelayMs) {
+				return
+			}
 		}
 
 		// A request with thinking enabled gets a thinking block even when the
@@ -136,11 +139,13 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 
 		// slow_header_ms delay
 		if cfg.SlowHeaderMs > 0 {
-			time.Sleep(time.Duration(cfg.SlowHeaderMs) * time.Millisecond)
+			if !waitCancelable(r.Context(), cfg.SlowHeaderMs) {
+				return
+			}
 		}
 
 		if req.Stream {
-			handleAnthropicStream(w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput)
+			handleAnthropicStream(r.Context(), w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput)
 		} else {
 			handleAnthropicNonStream(w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput)
 		}
@@ -255,17 +260,19 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 	writeValidatedJSON(w, cfg, kindAnthropicMessage, "anthropic message", resp)
 }
 
-func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
+func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
 	sse := newSSEWriter(w)
 	validate := shouldValidate(cfg) && !bypassesValidation(cfg)
 
-	// emit validates the SSE data payload against the pinned
+	// writeFrame validates the SSE data payload against the pinned
 	// MessageStreamEvent union (ping via the local arm) when
 	// validate_responses is on — a violation severs the stream — then
 	// writes the event and applies the disconnect_after_event fault: when
 	// the just-written event type matches the knob, the connection is cut
-	// (RST) and the handler must stop.
-	emit := func(event, data string) bool {
+	// (RST) and the handler must stop. Injected fault frames go through
+	// here too, so deliberately off-vocabulary faults (unknown_event,
+	// unknown_block, stream_error) need validate_responses:false.
+	writeFrame := func(event, data string) bool {
 		if validate {
 			if err := validateEmittedBody(kindAnthropicEvent, []byte(data)); err != nil {
 				failStreamValidation(w, "anthropic stream event "+event, []byte(data), err)
@@ -279,10 +286,22 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 		}
 		return false
 	}
+	inj := newStreamFaultInjector(cfg.streamFaults, w, sse, writeFrame)
+
+	// emit writes one real stream event, then gives the fault injector its
+	// shot at the just-written frame. Returns true when the stream is over.
+	emit := func(event, data string) bool {
+		if writeFrame(event, data) {
+			return true
+		}
+		return inj.afterFrame(event)
+	}
 
 	// TTFT delay
 	if cfg.TtftMs > 0 {
-		sleepWithPings(sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs)
+		if !sleepWithPings(ctx, sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs) {
+			return
+		}
 	}
 
 	// message_start
@@ -360,7 +379,9 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 				}
 			}
 			if delay > 0 {
-				sleepWithPings(sse, delay, cfg.SseKeepaliveIntervalMs)
+				if !sleepWithPings(ctx, sse, delay, cfg.SseKeepaliveIntervalMs) {
+					return
+				}
 			}
 
 			thinkDelta, _ := json.Marshal(map[string]any{
@@ -426,7 +447,9 @@ func handleAnthropicStream(w http.ResponseWriter, cfg *ProviderConfig, id, model
 			}
 		}
 		if delay > 0 {
-			sleepWithPings(sse, delay, cfg.SseKeepaliveIntervalMs)
+			if !sleepWithPings(ctx, sse, delay, cfg.SseKeepaliveIntervalMs) {
+				return
+			}
 		}
 
 		token := word

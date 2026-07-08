@@ -154,6 +154,8 @@ thinking_delay_ms = 0
 | `suppress_ping_events` | bool | false | Anthropic streaming: omit the typed `ping` event after `message_start`. The real API sends it, but the pinned spec's `MessageStreamEvent` union has no ping arm — the built-in validator handles it via a local ping arm, so this knob is only needed for external strict-validation harnesses |
 | `legacy_stream_usage` | bool | false | OpenAI streaming: restore the old mock usage shape (usage rides the finish chunk unconditionally, `stream_options.include_usage` ignored). Default emits the real API shape |
 | `validate_responses` | bool? | unset | Self-validation of the surfaces covered by the vendored closure of nanollm's pinned specs: OpenAI chat-completion and Anthropic messages bodies (non-stream + each SSE `data:` payload) and provider error envelopes on every endpoint, checked before writing (see [Spec-Sync & Response Validation](#spec-sync--response-validation) — `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/models` success bodies are outside the closure and not validated). Tri-state: unset defers to the `MOCKLM_VALIDATE_RESPONSES` env default; explicit `false` (e.g. via `X-MockLM-Fault`) opts a deliberate-fault request out |
+| `faults` | []FaultSpec | [] | Generalized two-knob fault list (WHEN × HOW) applied to every request; composes with all knobs above. See [Two-Knob Fault Specs](#two-knob-fault-specs-when--how) |
+| `attempt_faults` | [][]FaultSpec | [] | Per-attempt fault arrays: entry `i` applies only to the i-th request (0-based) seen by the provider since the last config update/reset; requests past the end get none. Generalizes `fail_first_n` — `[[{"mode":"error"}], []]` fails attempt 0 and lets attempt 1 succeed, the canonical retry/fallback scenario without header targeting |
 
 ## Request Fidelity
 
@@ -212,8 +214,57 @@ Checked before any content is generated:
 | 1 | Rate limit | `rate_limit_rpm > 0` | 429 + `Retry-After` header + provider-format error JSON |
 | 2 | Deterministic error | `fail_first_n > 0` (first N requests per provider) | Returns `error_status` with provider-format error JSON |
 | 3 | Random error | `error_rate > 0` (random roll) | Returns `error_status` with provider-format error JSON |
-| 4 | Timeout | `timeout_ms > 0` | Sleeps, then hijacks the TCP socket and sends RST |
-| 5 | Latency | `latency_ms > 0` | Sleeps before proceeding to generate the response |
+| 4 | Pre-body fault specs | `faults` / `attempt_faults` entries with mode `error`, or `disconnect` without a stream WHEN | Provider-format error (`error_status`/`error_type`/`error_message`) or RST, after an optional cancel-aware `after_ms` hold |
+| 5 | Timeout | `timeout_ms > 0` | Sleeps (cancel-aware), then hijacks the TCP socket and sends RST |
+| 6 | Latency | `latency_ms > 0` | Sleeps (cancel-aware) before proceeding to generate the response |
+
+All fault-path waits are cancel-aware: a client disconnect frees the handler
+immediately instead of leaking it into the sleep.
+
+### Two-Knob Fault Specs (WHEN × HOW)
+
+`faults` (every request) and `attempt_faults` (per request index) carry
+uniform fault specs with two orthogonal knobs. **WHEN** (all optional,
+AND-ed; absent = first opportunity): `after_ms`, `after_bytes` (body bytes
+written), `after_event` (fires right after the named Anthropic SSE event),
+`after_n` (SSE frames written). **HOW** (`mode`):
+
+| `mode` | Phase | Behavior |
+|---|---|---|
+| `error` | pre-body | HTTP error with `error_status`/`error_type`/`error_message` (defaults derive from the provider + config `error_status`). Cannot fire mid-stream — the status is locked once the body starts; specs that try are rejected with 400 |
+| `disconnect` | pre-body or stream | TCP hijack + RST; runs mid-stream when any of `after_event`/`after_n`/`after_bytes` is set |
+| `malformed_chunk` | stream | Injects `{INVALID JSON CORRUPT`; stream continues |
+| `unknown_event` | stream (Anthropic) | **B1**: well-formed but off-vocabulary top-level event (`event_type`, default `message_future`), `repeat` times — same type twice in one stream is the decoder warn-once probe |
+| `unknown_block` | stream (Anthropic) | **B2**: complete content block (start + stop) of `block_type` — spec-accurate shapes for the real suppressed types (`redacted_thinking`, `server_tool_use`), a generic probe otherwise |
+| `stream_error` | stream (Anthropic) | **B5**: mid-stream `event: error` with `error_type`/`error_message` (default `overloaded_error`); the stream continues — compose `{"mode":"disconnect","after_event":"error"}` to cut after it |
+
+Specs fire at most once per request and compose: later specs can match
+frames injected by earlier ones. The decoder-fault modes emit well-formed
+payloads that are **off the pinned `MessageStreamEvent` union**, so
+scenarios driving them must set `validate_responses: false` — with
+validation on, the self-validator severs the stream at the injected frame.
+
+```bash
+# Attempt 0 → 503, attempt 1 → success (retry test, no header needed):
+curl -s http://localhost:9999/admin/config -X PUT -d '{"openai":{
+  "attempt_faults":[[{"mode":"error","error_status":503}],[]]},"anthropic":{}}'
+
+# Mid-stream overloaded error after 3 frames, then the stream dies:
+curl -s http://localhost:9999/admin/config -X PUT -d '{"anthropic":{
+  "validate_responses":false,
+  "faults":[{"mode":"stream_error","error_type":"overloaded_error","after_n":3},
+            {"mode":"disconnect","after_event":"error"}]},"openai":{}}'
+```
+
+### Request-Count Introspection
+
+`GET /admin/request-count` returns `{"openai": N, "anthropic": M}` — the
+per-provider request counts since the last reset/config update (the same
+counter that indexes `fail_first_n` and `attempt_faults`). Every request
+that reaches fault processing counts, including ones that end up
+rate-limited or failed, so a test can assert exactly how many attempts a
+proxy made. `POST /admin/request-count/reset` zeroes it; config updates and
+`/admin/reset` do too.
 
 ### Per-Request Fault Targeting: `X-MockLM-Fault` header
 
@@ -244,6 +295,7 @@ Checked per-chunk during streaming:
 | Disconnect | `disconnect_after_chunks > 0` | TCP hijack + RST after N content chunks. No `[DONE]` sentinel. |
 | Event-scheduled disconnect | `disconnect_after_event = "message_delta"` (Anthropic) | TCP hijack + RST immediately after the named event type is written — cuts *between* protocol events rather than by word count |
 | Malformed chunk | `malformed_chunk = true` | Injects `{INVALID JSON CORRUPT` at chunk `totalChunks/2`. Stream **continues** after the bad chunk. |
+| Fault specs | stream-phase `faults` / `attempt_faults` entries | The generalized engine: disconnects, malformed frames, and the decoder-fault injections (`unknown_event` / `unknown_block` / `stream_error`) scheduled by `after_event` / `after_n` / `after_bytes` / `after_ms` (see [Two-Knob Fault Specs](#two-knob-fault-specs-when--how)) |
 
 ### Examples
 
@@ -540,7 +592,7 @@ cd ../nanollm && MOCKLM_BINARY=../go-mocklm/mocklm cargo test --test integration
 | **No configurable response content** | Content is random words from a fixed vocabulary; can't return specific text for transform testing |
 | ~~**No per-request fault injection**~~ | ~~Faults are global config; can't target a single request via header~~ (resolved: `X-MockLM-Fault` header overlays any provider knob per request) |
 | ~~**No request recording**~~ | ~~No way to inspect what requests mocklm received~~ (resolved: all providers now record requests via `/admin/requests`) |
-| **No mid-stream error events** | Can disconnect or inject malformed JSON, but can't inject a proper error JSON event mid-stream |
+| ~~**No mid-stream error events**~~ | ~~Can disconnect or inject malformed JSON, but can't inject a proper error JSON event mid-stream~~ (resolved: `{"mode":"stream_error"}` fault specs inject a well-formed `event: error` at any WHEN) |
 | **No Responses API reasoning streaming** | Reasoning items only appear in the final `response.completed` event, not streamed incrementally |
 | **No provider-specific rate limit headers** | Only sets `Retry-After`; missing `x-ratelimit-*` (OpenAI) and `anthropic-ratelimit-*` headers |
 | ~~**No SSE keep-alive/ping events**~~ | ~~Real providers send `: ping` comment lines~~ (resolved: `sse_keepalive_interval_ms` emits pings during TTFT waits) |

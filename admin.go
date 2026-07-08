@@ -110,6 +110,37 @@ func handleAdminClearRequests(state *ServerState) http.HandlerFunc {
 	}
 }
 
+// handleAdminGetRequestCount returns the per-provider request counts since
+// the last reset/config update — the attempt-counter oracle: a test can
+// assert exactly how many attempts the proxy made (retries, fallbacks)
+// without parsing recorded bodies. The same counter indexes fail_first_n
+// and attempt_faults.
+func handleAdminGetRequestCount(state *ServerState) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		openai, anthropic := state.AttemptCounts()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"openai":    openai,
+			"anthropic": anthropic,
+		})
+	}
+}
+
+// handleAdminResetRequestCount zeroes the per-provider request counters
+// (they also reset on every config update/reset), so one scenario's
+// attempts never leak into the next assertion.
+func handleAdminResetRequestCount(state *ServerState) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		state.ResetAttempts()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "reset",
+		})
+	}
+}
+
 // handleAdminGetPresets lists all available presets.
 func handleAdminGetPresets() http.HandlerFunc {
 	presets := builtinPresets()

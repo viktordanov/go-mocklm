@@ -8,6 +8,9 @@ import (
 type sseWriter struct {
 	w       http.ResponseWriter
 	flusher http.Flusher
+	// bytes counts everything written to the stream body so far; it backs
+	// the after_bytes fault-trigger knob (fault.go).
+	bytes int
 }
 
 func newSSEWriter(w http.ResponseWriter) *sseWriter {
@@ -20,7 +23,8 @@ func newSSEWriter(w http.ResponseWriter) *sseWriter {
 
 // writeData writes an SSE data-only line (OpenAI format).
 func (s *sseWriter) writeData(data string) {
-	fmt.Fprintf(s.w, "data: %s\n\n", data)
+	n, _ := fmt.Fprintf(s.w, "data: %s\n\n", data)
+	s.bytes += n
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
@@ -28,7 +32,8 @@ func (s *sseWriter) writeData(data string) {
 
 // writeEvent writes an SSE event+data pair (Anthropic format).
 func (s *sseWriter) writeEvent(event, data string) {
-	fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data)
+	n, _ := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data)
+	s.bytes += n
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
@@ -36,7 +41,8 @@ func (s *sseWriter) writeEvent(event, data string) {
 
 // writeDone writes the OpenAI [DONE] sentinel.
 func (s *sseWriter) writeDone() {
-	fmt.Fprint(s.w, "data: [DONE]\n\n")
+	n, _ := fmt.Fprint(s.w, "data: [DONE]\n\n")
+	s.bytes += n
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
@@ -44,7 +50,8 @@ func (s *sseWriter) writeDone() {
 
 // writePing writes an SSE comment line for keep-alive.
 func (s *sseWriter) writePing() {
-	fmt.Fprint(s.w, ": ping\n\n")
+	n, _ := fmt.Fprint(s.w, ": ping\n\n")
+	s.bytes += n
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}

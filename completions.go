@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -78,11 +79,13 @@ func handleOpenAICompletions(state *ServerState) http.HandlerFunc {
 		}
 
 		if cfg.SlowHeaderMs > 0 {
-			time.Sleep(time.Duration(cfg.SlowHeaderMs) * time.Millisecond)
+			if !waitCancelable(r.Context(), cfg.SlowHeaderMs) {
+				return
+			}
 		}
 
 		if req.Stream {
-			handleCompletionsStream(w, &cfg, id, model, words, outputTokens)
+			handleCompletionsStream(r.Context(), w, &cfg, id, model, words, outputTokens)
 		} else {
 			handleCompletionsNonStream(w, &cfg, id, model, words, outputTokens)
 		}
@@ -114,11 +117,13 @@ func handleCompletionsNonStream(w http.ResponseWriter, _ *ProviderConfig, id, mo
 	json.NewEncoder(w).Encode(resp)
 }
 
-func handleCompletionsStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, outputTokens int) {
+func handleCompletionsStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, outputTokens int) {
 	sse := newSSEWriter(w)
 
 	if cfg.TtftMs > 0 {
-		sleepWithPings(sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs)
+		if !sleepWithPings(ctx, sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs) {
+			return
+		}
 	}
 
 	// Content chunk (single chunk keeps the legacy emulation simple)

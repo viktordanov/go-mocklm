@@ -36,10 +36,12 @@ type ServerState struct {
 	openaiActive    atomic.Int32
 	anthropicActive atomic.Int32
 
-	// fail_first_n request counters (per provider); reset on Update/Reset
-	// so a fresh fault config starts counting from zero.
-	openaiFailSeq    atomic.Int64
-	anthropicFailSeq atomic.Int64
+	// Per-provider request (attempt) counters: drive fail_first_n and
+	// attempt_faults indexing and back the /admin/request-count
+	// introspection oracle. Reset on Update/Reset so a fresh fault scenario
+	// starts counting from zero.
+	openaiAttempts    atomic.Int64
+	anthropicAttempts atomic.Int64
 }
 
 // NewServerState creates a ServerState from the initial config and builds rate limiters.
@@ -86,7 +88,7 @@ func (s *ServerState) Update(openai, anthropic ProviderConfig, presetName string
 	s.cfg.Anthropic = anthropic
 	s.activePreset = presetName
 	s.rebuildLimiters()
-	s.resetFailSeqs()
+	s.ResetAttempts()
 }
 
 // Reset restores the initial startup config.
@@ -98,21 +100,29 @@ func (s *ServerState) Reset() {
 	s.cfg.Anthropic = s.initialCfg.Anthropic
 	s.activePreset = ""
 	s.rebuildLimiters()
-	s.resetFailSeqs()
+	s.ResetAttempts()
 }
 
-// NextFailSeq returns the 1-based sequence number of this request for the
-// provider's fail_first_n counter.
-func (s *ServerState) NextFailSeq(provider string) int64 {
+// NextAttempt returns the 1-based sequence number of this request for the
+// provider's attempt counter (fail_first_n, attempt_faults, and the
+// /admin/request-count oracle all share it).
+func (s *ServerState) NextAttempt(provider string) int64 {
 	if provider == "openai" {
-		return s.openaiFailSeq.Add(1)
+		return s.openaiAttempts.Add(1)
 	}
-	return s.anthropicFailSeq.Add(1)
+	return s.anthropicAttempts.Add(1)
 }
 
-func (s *ServerState) resetFailSeqs() {
-	s.openaiFailSeq.Store(0)
-	s.anthropicFailSeq.Store(0)
+// AttemptCounts returns the per-provider request counts since the last
+// reset/config update.
+func (s *ServerState) AttemptCounts() (openai, anthropic int64) {
+	return s.openaiAttempts.Load(), s.anthropicAttempts.Load()
+}
+
+// ResetAttempts zeroes the per-provider request counters.
+func (s *ServerState) ResetAttempts() {
+	s.openaiAttempts.Store(0)
+	s.anthropicAttempts.Store(0)
 }
 
 // maxRecordedRequests caps the in-memory recording buffer; the oldest

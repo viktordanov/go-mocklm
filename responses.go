@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,7 +65,9 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 		}
 
 		if cfg.ThinkingDelayMs > 0 {
-			time.Sleep(time.Duration(cfg.ThinkingDelayMs) * time.Millisecond)
+			if !waitCancelable(r.Context(), cfg.ThinkingDelayMs) {
+				return
+			}
 		}
 
 		// Resolve output tokens: header > body > config
@@ -92,11 +95,13 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 
 		// slow_header_ms delay
 		if cfg.SlowHeaderMs > 0 {
-			time.Sleep(time.Duration(cfg.SlowHeaderMs) * time.Millisecond)
+			if !waitCancelable(r.Context(), cfg.SlowHeaderMs) {
+				return
+			}
 		}
 
 		if req.Stream {
-			handleResponsesStream(w, &cfg, model, words, inputTokens, completionTokens)
+			handleResponsesStream(r.Context(), w, &cfg, model, words, inputTokens, completionTokens)
 		} else {
 			handleResponsesNonStream(w, &cfg, model, words, inputTokens, completionTokens)
 		}
@@ -131,7 +136,7 @@ func handleResponsesNonStream(w http.ResponseWriter, cfg *ProviderConfig, model 
 	json.NewEncoder(w).Encode(resp)
 }
 
-func handleResponsesStream(w http.ResponseWriter, cfg *ProviderConfig, model string, words []string, inputTokens, completionTokens int) {
+func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, model string, words []string, inputTokens, completionTokens int) {
 	if cfg.ReasoningTokens > 0 {
 		completionTokens = len(words) + cfg.ReasoningTokens
 	}
@@ -140,7 +145,9 @@ func handleResponsesStream(w http.ResponseWriter, cfg *ProviderConfig, model str
 
 	// TTFT delay
 	if cfg.TtftMs > 0 {
-		sleepWithPings(sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs)
+		if !sleepWithPings(ctx, sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs) {
+			return
+		}
 	}
 
 	respID := fmt.Sprintf("resp_mock_%d", time.Now().UnixNano())
@@ -203,7 +210,9 @@ func handleResponsesStream(w http.ResponseWriter, cfg *ProviderConfig, model str
 			}
 		}
 		if delay > 0 {
-			sleepWithPings(sse, delay, cfg.SseKeepaliveIntervalMs)
+			if !sleepWithPings(ctx, sse, delay, cfg.SseKeepaliveIntervalMs) {
+				return
+			}
 		}
 
 		token := word
