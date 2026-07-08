@@ -128,6 +128,9 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		if cfg.Deterministic {
 			words = generateDeterministicWords(outputTokens)
 		}
+		if cfg.ContentText != "" {
+			words = strings.Fields(cfg.ContentText)
+		}
 		model := req.Model
 		if model == "" {
 			model = "claude-3-haiku-20240307"
@@ -219,6 +222,9 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 	}
 
 	content := joinContent(words)
+	if cfg.ContentText != "" {
+		content = strings.Join(words, " ")
+	}
 
 	contentBlocks := []map[string]any{}
 
@@ -262,6 +268,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 
 func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
 	sse := newSSEWriter(w)
+	sse.applyTransportFaults(ctx, cfg)
 	validate := shouldValidate(cfg) && !bypassesValidation(cfg)
 
 	// writeFrame validates the SSE data payload against the pinned
@@ -286,7 +293,7 @@ func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		}
 		return false
 	}
-	inj := newStreamFaultInjector(cfg.streamFaults, w, sse, writeFrame)
+	inj := newStreamFaultInjector(ctx, cfg.streamFaults, w, sse, writeFrame)
 
 	// emit writes one real stream event, then gives the fault injector its
 	// shot at the just-written frame. Returns true when the stream is over.
@@ -453,12 +460,15 @@ func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		}
 
 		token := word
-		if i == 0 {
-			token = capitalize(token)
+		if cfg.ContentText == "" {
+			if i == 0 {
+				token = capitalize(token)
+			}
+			if i == len(words)-1 {
+				token += "."
+			}
 		}
-		if i == len(words)-1 {
-			token += "."
-		} else {
+		if i != len(words)-1 {
 			token += " "
 		}
 
@@ -564,6 +574,8 @@ func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		"type": "message_stop",
 	})
 	emit("message_stop", string(msgStop))
+	// Coalesced-frame mode (A3): the buffered tail goes out with the stream.
+	sse.flushPending()
 }
 
 // splitJSONFragments splits a JSON string into n roughly equal pieces for

@@ -237,12 +237,46 @@ written), `after_event` (fires right after the named Anthropic SSE event),
 | `unknown_event` | stream (Anthropic) | **B1**: well-formed but off-vocabulary top-level event (`event_type`, default `message_future`), `repeat` times — same type twice in one stream is the decoder warn-once probe |
 | `unknown_block` | stream (Anthropic) | **B2**: complete content block (start + stop) of `block_type` — spec-accurate shapes for the real suppressed types (`redacted_thinking`, `server_tool_use`), a generic probe otherwise |
 | `stream_error` | stream (Anthropic) | **B5**: mid-stream `event: error` with `error_type`/`error_message` (default `overloaded_error`); the stream continues — compose `{"mode":"disconnect","after_event":"error"}` to cut after it |
+| `stall` | stream | **A7**: stop writing mid-stream and hold the connection open — no bytes, no close — until the client disconnects. Fires after the first frame when no WHEN is set |
+| `non_json_body` | pre-body | **C9**: a 200 with a `text/html` error-page body instead of JSON (the classic intermediary-proxy failure). Pre-body only; stream WHENs are rejected with 400 |
+
+`error`-mode specs additionally accept `retry_after`, set verbatim on the
+`Retry-After` header — numeric seconds or an HTTP-date (**C2**: the date
+form must be ignored by seconds-only clients, falling back to their own
+backoff).
 
 Specs fire at most once per request and compose: later specs can match
 frames injected by earlier ones. The decoder-fault modes emit well-formed
 payloads that are **off the pinned `MessageStreamEvent` union**, so
 scenarios driving them must set `validate_responses: false` — with
 validation on, the self-validator severs the stream at the injected frame.
+
+### Usage Faults (`usage_fault`, OpenAI chat)
+
+The `usage_fault` provider knob distorts the OpenAI chat usage surface —
+the B-OAI-8 shape-coupled-extraction probes. Anthropic usage is
+spec-required and not covered.
+
+| Value | Fault |
+|---|---|
+| `omit` | **D1**: no usage key anywhere — the non-stream response and the entire stream, even when `stream_options.include_usage` was requested. Spec-valid (usage is optional in the pinned response root), so it composes with `validate_responses` |
+| `partial` | **D2**: every emitted usage object carries `prompt_tokens` **only** (no `completion_tokens`/`total_tokens`/`*_details`). Off-spec — `CompletionUsage` requires all three — so scenarios must set `validate_responses: false` |
+| `trailer` | **D3**: force the real `include_usage` wire shape (`usage: null` on every chunk + a trailing `choices: []` usage chunk) even when the request didn't set `stream_options.include_usage` |
+
+### Deterministic SSE Transport Faults (A2/A3)
+
+Provider knobs that alter how SSE frames hit the wire without changing
+their payloads (the re-framing/robustness probes; applied on the chat and
+messages streams):
+
+| Knob | Fault |
+|---|---|
+| `fragment_offset` | **A2**: every frame is flushed in two writes split at this byte offset (frames shorter than the offset go out whole) |
+| `fragment_split` | `"rune"` cuts one byte into the frame's first multibyte UTF-8 sequence (pure-ASCII frames fall back to `fragment_offset`); `"event"` cuts right after the first line — between the `event:` and `data:` lines of an Anthropic frame |
+| `fragment_delay_ms` | pause between the two fragment writes so the boundary survives kernel buffering and arrives as two reads (default 5 when fragmenting) |
+| `crlf_frames` | **A3**: every SSE line ending becomes `\r\n` — valid per the SSE spec, hostile to naive `\n\n` re-framers |
+| `coalesce_frames` | buffer N frames into a single write+flush so one TCP chunk carries several frames (composes with `crlf_frames`; mutually exclusive with fragmentation — coalescing wins; the buffered tail flushes at stream end) |
+| `content_text` | emit this text verbatim as the response content (words split on whitespace, one per stream delta, no capitalize/period decoration) — lets a scenario stream known bytes, e.g. multibyte runes for `fragment_split: "rune"` |
 
 ```bash
 # Attempt 0 → 503, attempt 1 → success (retry test, no header needed):

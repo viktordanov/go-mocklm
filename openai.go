@@ -98,6 +98,9 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 		}
 
 		words := generateWords(outputTokens)
+		if cfg.ContentText != "" {
+			words = strings.Fields(cfg.ContentText)
+		}
 		model := req.Model
 		if model == "" {
 			model = "gpt-4"
@@ -130,6 +133,17 @@ func openaiFinishReason(cfg *ProviderConfig) string {
 		return "tool_calls"
 	}
 	return "stop"
+}
+
+// openaiUsageWithFault resolves the usage object under the usage_fault knob:
+// D2 "partial" strips it down to prompt_tokens only (off-spec — needs
+// validate_responses:false); everything else gets the full spec shape.
+// Callers handle "omit" themselves (there is no object to build).
+func openaiUsageWithFault(cfg *ProviderConfig, promptTokens, completionTokens int) map[string]any {
+	if cfg.UsageFault == "partial" {
+		return map[string]any{"prompt_tokens": promptTokens}
+	}
+	return openaiUsage(cfg, promptTokens, completionTokens)
 }
 
 // openaiUsage builds the chat usage object. The real API sends the
@@ -175,7 +189,9 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 	}
 
 	content := joinContent(words)
-	usage := openaiUsage(cfg, promptTokens, completionTokens)
+	if cfg.ContentText != "" {
+		content = strings.Join(words, " ")
+	}
 
 	message := map[string]any{
 		"role":        "assistant",
@@ -206,7 +222,11 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 				"finish_reason": openaiFinishReason(cfg),
 			},
 		},
-		"usage": usage,
+	}
+	// D1 "omit" leaves usage out entirely — spec-valid, since the pinned
+	// response root doesn't require it.
+	if cfg.UsageFault != "omit" {
+		resp["usage"] = openaiUsageWithFault(cfg, promptTokens, completionTokens)
 	}
 
 	writeValidatedJSON(w, cfg, kindOpenAIChat, "openai chat completion", resp)
@@ -214,7 +234,18 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 
 func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any, includeUsage bool) {
 	sse := newSSEWriter(w)
+	sse.applyTransportFaults(ctx, cfg)
 	validate := shouldValidate(cfg) && !bypassesValidation(cfg)
+
+	// Usage faults (D1-D3): "trailer" forces the real include_usage wire
+	// shape even when the request didn't ask; "omit" suppresses usage
+	// everywhere, even when it did.
+	switch cfg.UsageFault {
+	case "trailer":
+		includeUsage = true
+	case "omit":
+		includeUsage = false
+	}
 
 	// writeFrame validates one data payload against the pinned
 	// CreateChatCompletionStreamResponse root when validate_responses is on
@@ -231,7 +262,7 @@ func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *Pro
 		sse.writeData(data)
 		return false
 	}
-	inj := newStreamFaultInjector(cfg.streamFaults, w, sse, writeFrame)
+	inj := newStreamFaultInjector(ctx, cfg.streamFaults, w, sse, writeFrame)
 
 	// emitChunk writes one real chunk, then gives the fault injector its
 	// shot. Returns false when the stream must abort.
@@ -305,13 +336,16 @@ func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *Pro
 		}
 
 		token := word
-		if i == 0 {
-			// Capitalize first word
-			token = capitalize(token)
+		if cfg.ContentText == "" {
+			if i == 0 {
+				// Capitalize first word
+				token = capitalize(token)
+			}
+			if i == len(words)-1 {
+				token += "."
+			}
 		}
-		if i == len(words)-1 {
-			token += "."
-		} else {
+		if i != len(words)-1 {
 			token += " "
 		}
 
@@ -392,8 +426,8 @@ func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *Pro
 			},
 		},
 	}
-	if cfg.LegacyStreamUsage {
-		finishChunk["usage"] = openaiUsage(cfg, promptTokens, completionTokens)
+	if cfg.LegacyStreamUsage && cfg.UsageFault != "omit" {
+		finishChunk["usage"] = openaiUsageWithFault(cfg, promptTokens, completionTokens)
 	} else if includeUsage {
 		finishChunk["usage"] = nil
 	}
@@ -411,7 +445,7 @@ func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *Pro
 			"system_fingerprint": "fp_mock",
 			"service_tier":       "default",
 			"choices":            []any{},
-			"usage":              openaiUsage(cfg, promptTokens, completionTokens),
+			"usage":              openaiUsageWithFault(cfg, promptTokens, completionTokens),
 		}
 		if !emitChunk(usageChunk) {
 			return

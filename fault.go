@@ -55,6 +55,12 @@ type FaultSpec struct {
 	//                     error_type/error_message; stream continues
 	//                     (compose {"mode":"disconnect","after_event":
 	//                     "error"} to cut after it)
+	//   "stall"           A7: stop writing mid-stream and hold the
+	//                     connection open — no bytes, no close — until the
+	//                     client disconnects. Stream-phase only (fires
+	//                     after the first frame when no WHEN is set).
+	//   "non_json_body"   C9: a 200 with a text/html body instead of JSON —
+	//                     the classic proxy error page. Pre-body only.
 	//
 	// The decoder-fault modes (unknown_event / unknown_block /
 	// stream_error) emit WELL-FORMED but off-union payloads: the pinned
@@ -67,6 +73,10 @@ type FaultSpec struct {
 	ErrorStatus  int    `toml:"error_status" json:"error_status,omitempty"`
 	ErrorType    string `toml:"error_type" json:"error_type,omitempty"`
 	ErrorMessage string `toml:"error_message" json:"error_message,omitempty"`
+	// RetryAfter sets the Retry-After header verbatim on an "error" fault —
+	// numeric seconds or an HTTP-date (C2: the date form must be ignored by
+	// spec-narrow clients and fall back to their own backoff).
+	RetryAfter string `toml:"retry_after" json:"retry_after,omitempty"`
 	EventType    string `toml:"event_type" json:"event_type,omitempty"`
 	BlockType    string `toml:"block_type" json:"block_type,omitempty"`
 	// Repeat emits the injected frame/block this many times (default 1) —
@@ -78,7 +88,7 @@ type FaultSpec struct {
 // pre-body in checkFaults).
 func (f *FaultSpec) streamPhase() bool {
 	switch f.Mode {
-	case "malformed_chunk", "unknown_event", "unknown_block", "stream_error":
+	case "malformed_chunk", "unknown_event", "unknown_block", "stream_error", "stall":
 		return true
 	case "disconnect":
 		return f.AfterEvent != "" || f.AfterN > 0 || f.AfterBytes > 0
@@ -89,11 +99,11 @@ func (f *FaultSpec) streamPhase() bool {
 // validateFaultSpec rejects specs that cannot fire as written.
 func validateFaultSpec(f *FaultSpec) error {
 	switch f.Mode {
-	case "error":
+	case "error", "non_json_body":
 		if f.AfterEvent != "" || f.AfterN > 0 || f.AfterBytes > 0 {
 			return fmt.Errorf("fault mode %q cannot fire mid-stream (the status is locked once the body starts); use \"stream_error\" or \"disconnect\"", f.Mode)
 		}
-	case "disconnect", "malformed_chunk", "unknown_event", "unknown_block", "stream_error":
+	case "disconnect", "malformed_chunk", "unknown_event", "unknown_block", "stream_error", "stall":
 	default:
 		return fmt.Errorf("unknown fault mode %q", f.Mode)
 	}
@@ -323,7 +333,16 @@ func checkFaults(w http.ResponseWriter, r *http.Request, cfg *ProviderConfig, li
 			if msg == "" {
 				msg = fmt.Sprintf("Simulated fault error (attempt %d, status %d)", attempt, status)
 			}
+			if f.RetryAfter != "" {
+				w.Header().Set("Retry-After", f.RetryAfter)
+			}
 			writeErrorResponse(w, cfg, status, provider, errType, msg)
+		case "non_json_body":
+			// C9: a 200 whose body is not JSON — what an intermediary
+			// proxy's error page looks like to a JSON-expecting client.
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "<html><head><title>502 Bad Gateway</title></head><body><h1>Bad Gateway</h1><p>mock upstream proxy error page</p></body></html>\n")
 		case "disconnect":
 			hijackAndClose(w)
 		}
@@ -378,6 +397,7 @@ type frameWriter func(event, data string) bool
 // (unknown_event / unknown_block / stream_error) therefore require the
 // scenario to set validate_responses:false. A nil injector is a no-op.
 type streamFaultInjector struct {
+	ctx    context.Context
 	w      http.ResponseWriter
 	sse    *sseWriter
 	write  frameWriter
@@ -391,11 +411,12 @@ type streamFaultInjector struct {
 	blockIndex int
 }
 
-func newStreamFaultInjector(specs []FaultSpec, w http.ResponseWriter, sse *sseWriter, write frameWriter) *streamFaultInjector {
+func newStreamFaultInjector(ctx context.Context, specs []FaultSpec, w http.ResponseWriter, sse *sseWriter, write frameWriter) *streamFaultInjector {
 	if len(specs) == 0 {
 		return nil
 	}
 	return &streamFaultInjector{
+		ctx:        ctx,
 		w:          w,
 		sse:        sse,
 		write:      write,
@@ -458,6 +479,15 @@ func (inj *streamFaultInjector) fire(f *FaultSpec) bool {
 	switch f.Mode {
 	case "disconnect":
 		hijackAndClose(inj.w)
+		return true
+
+	case "stall":
+		// A7: go silent while keeping the connection open — no bytes, no
+		// FIN, no RST. The only way out is the client giving up (context
+		// cancellation); then the stream is simply over.
+		if inj.ctx != nil {
+			<-inj.ctx.Done()
+		}
 		return true
 
 	case "malformed_chunk":

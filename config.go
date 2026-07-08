@@ -92,6 +92,47 @@ type ProviderConfig struct {
 	// design. The typed ping event validates against a local ping arm,
 	// since the pinned MessageStreamEvent union has none.
 	ValidateResponses *bool `toml:"validate_responses" json:"validate_responses,omitempty"`
+	// UsageFault distorts the OpenAI chat usage surface (the B-OAI-8 probes;
+	// Anthropic usage is spec-required and not covered):
+	//   "omit"    D1: no usage key anywhere — non-stream response and the
+	//             whole stream, even when include_usage was requested.
+	//             Spec-valid (usage is optional in the pinned response root),
+	//             so it composes with validate_responses.
+	//   "partial" D2: usage carries prompt_tokens ONLY (no completion_tokens
+	//             / total_tokens / *_details). Off-spec — CompletionUsage
+	//             requires all three — so scenarios must set
+	//             validate_responses:false.
+	//   "trailer" D3: force the real include_usage wire shape (usage:null on
+	//             every chunk + trailing choices:[] usage chunk) even when
+	//             the request didn't set stream_options.include_usage.
+	UsageFault string `toml:"usage_fault" json:"usage_fault"`
+	// ContentText overrides generated content verbatim: the emitted content
+	// is its whitespace-separated words joined by single spaces, with none
+	// of the usual capitalize/period decoration. Lets a scenario stream
+	// known bytes — e.g. multibyte UTF-8 runes for fragment_split "rune".
+	ContentText string `toml:"content_text" json:"content_text"`
+	// FragmentOffset > 0 flushes every SSE frame in two writes split at this
+	// byte offset (A2 deterministic frame fragmentation). Frames shorter
+	// than the offset go out whole.
+	FragmentOffset int `toml:"fragment_offset" json:"fragment_offset"`
+	// FragmentSplit picks the split point instead of a fixed offset:
+	// "rune" cuts one byte into the frame's first multibyte UTF-8 sequence
+	// (falling back to fragment_offset when the frame is pure ASCII);
+	// "event" cuts right after the first line — between the `event:` and
+	// `data:` lines of an Anthropic frame.
+	FragmentSplit string `toml:"fragment_split" json:"fragment_split"`
+	// FragmentDelayMs pauses between the two fragment writes so the
+	// boundary survives kernel buffering and reaches the peer as two reads.
+	// Defaults to 5 when fragmenting.
+	FragmentDelayMs int `toml:"fragment_delay_ms" json:"fragment_delay_ms"`
+	// CrlfFrames emits every SSE line ending as \r\n (A3) — valid per the
+	// SSE spec, hostile to naive \n\n re-framers.
+	CrlfFrames bool `toml:"crlf_frames" json:"crlf_frames"`
+	// CoalesceFrames > 1 buffers N SSE frames into a single write+flush so
+	// one TCP chunk carries several frames (composes with crlf_frames for
+	// the A3 repro). Mutually exclusive with fragmentation (coalescing
+	// wins). The buffered tail is flushed at stream end.
+	CoalesceFrames int `toml:"coalesce_frames" json:"coalesce_frames"`
 	// Faults is the generalized two-knob fault list (WHEN × HOW, see
 	// FaultSpec in fault.go). Every spec applies to every request, composing
 	// with the legacy knobs above. Pre-body modes fire in checkFaults;
