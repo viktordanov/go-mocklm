@@ -150,7 +150,7 @@ func TestRequestCountIntrospection(t *testing.T) {
 	// A config update resets too, so each scenario starts counting fresh.
 	postAnthropic(t, srv.URL, anthropicBody(false)).Body.Close()
 	snap, _ := state.Config()
-	state.Update(snap.OpenAI, snap.Anthropic, "custom")
+	state.Update(snap.OpenAI, snap.Anthropic, snap.Bedrock, "custom")
 	if o, a := getCounts(); o != 0 || a != 0 {
 		t.Fatalf("counters should reset on config update, got openai=%v anthropic=%v", o, a)
 	}

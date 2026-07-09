@@ -22,6 +22,11 @@ import (
 
 // nanollmSpecDir resolves the sibling nanollm spec directory, honouring
 // NANOLLM_SPEC_DIR for non-sibling checkouts.
+//
+// A missing dir normally skips (a repo-only checkout can still run the rest
+// of the suite), but with MOCKLM_REQUIRE_SPEC_SYNC set the skip becomes a
+// hard failure — the CI gate that keeps a green run from silently meaning
+// "the drift tripwire DID NOT RUN".
 func nanollmSpecDir(t *testing.T) string {
 	t.Helper()
 	dir := os.Getenv("NANOLLM_SPEC_DIR")
@@ -29,6 +34,10 @@ func nanollmSpecDir(t *testing.T) string {
 		dir = "../nanollm/spec"
 	}
 	if _, err := os.Stat(dir); err != nil {
+		if envTruthy(os.Getenv("MOCKLM_REQUIRE_SPEC_SYNC")) {
+			t.Fatalf("MOCKLM_REQUIRE_SPEC_SYNC is set but the nanollm spec dir was not found at %s "+
+				"(set NANOLLM_SPEC_DIR): %v — the spec-sync drift tripwire MUST run in this mode", dir, err)
+		}
 		t.Skipf("nanollm spec dir not found at %s (set NANOLLM_SPEC_DIR): %v — "+
 			"the spec-sync drift tripwire DID NOT RUN", dir, err)
 	}

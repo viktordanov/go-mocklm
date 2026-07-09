@@ -37,9 +37,13 @@ type ProviderConfig struct {
 	// it for stop_reason (e.g. "pause_turn", "refusal"); OpenAI responses
 	// use it for finish_reason (e.g. "content_filter"). Empty = default.
 	StopReason string `toml:"stop_reason" json:"stop_reason"`
-	// Strict enables contract-oracle request validation (Anthropic):
-	// unknown top-level fields, missing required fields, and out-of-range
-	// values are rejected with 400 like the real API (strict.go).
+	// Strict enables the Anthropic request-shape checker (bounded):
+	// request-side, Anthropic-only, driven by a manual field allowlist —
+	// NOT a general request-schema validator. Unknown top-level fields,
+	// missing required fields, and out-of-range values are rejected with
+	// 400 like the real API (strict.go). If it ever grows to OpenAI or
+	// Bedrock, that lands as a named per-provider checker, not a silent
+	// widening of this knob.
 	Strict bool `toml:"strict" json:"strict"`
 	// CacheReadTokens / CacheCreationTokens drive prompt-cache usage fields:
 	// Anthropic cache_read_input_tokens / cache_creation_input_tokens, and
@@ -159,6 +163,11 @@ type Config struct {
 	Server    ServerConfig   `toml:"server"`
 	OpenAI    ProviderConfig `toml:"openai"`
 	Anthropic ProviderConfig `toml:"anthropic"`
+	// Bedrock drives the AWS Bedrock Runtime Converse/ConverseStream mock
+	// (POST /model/{modelId}/converse[-stream]). Response bodies are
+	// hand-rolled and bounded like strict.go — there is no Bedrock schema
+	// in the spec-sync closure, so validate_responses cannot cover them.
+	Bedrock ProviderConfig `toml:"bedrock"`
 }
 
 func loadConfig() (*Config, error) {
@@ -181,6 +190,7 @@ func loadConfig() (*Config, error) {
 
 	applyProviderDefaults(&cfg.OpenAI)
 	applyProviderDefaults(&cfg.Anthropic)
+	applyProviderDefaults(&cfg.Bedrock)
 
 	return &cfg, nil
 }
@@ -203,9 +213,11 @@ func (c *Config) summary() string {
 	return fmt.Sprintf(
 		"Server: %s:%d\n"+
 			"OpenAI:    tokens=%d latency=%dms stream_delay=%dms error_rate=%.2f error_status=%d timeout=%dms disconnect_after=%d malformed=%v rate_limit=%drpm reasoning_tokens=%d thinking_delay=%dms\n"+
-			"Anthropic: tokens=%d latency=%dms stream_delay=%dms error_rate=%.2f error_status=%d timeout=%dms disconnect_after=%d malformed=%v rate_limit=%drpm reasoning_tokens=%d thinking_delay=%dms",
+			"Anthropic: tokens=%d latency=%dms stream_delay=%dms error_rate=%.2f error_status=%d timeout=%dms disconnect_after=%d malformed=%v rate_limit=%drpm reasoning_tokens=%d thinking_delay=%dms\n"+
+			"Bedrock:   tokens=%d latency=%dms stream_delay=%dms error_rate=%.2f error_status=%d timeout=%dms disconnect_after=%d malformed=%v rate_limit=%drpm reasoning_tokens=%d thinking_delay=%dms",
 		c.Server.Host, c.Server.Port,
 		c.OpenAI.Tokens, c.OpenAI.LatencyMs, c.OpenAI.StreamDelayMs, c.OpenAI.ErrorRate, c.OpenAI.ErrorStatus, c.OpenAI.TimeoutMs, c.OpenAI.DisconnectAfterChunks, c.OpenAI.MalformedChunk, c.OpenAI.RateLimitRPM, c.OpenAI.ReasoningTokens, c.OpenAI.ThinkingDelayMs,
 		c.Anthropic.Tokens, c.Anthropic.LatencyMs, c.Anthropic.StreamDelayMs, c.Anthropic.ErrorRate, c.Anthropic.ErrorStatus, c.Anthropic.TimeoutMs, c.Anthropic.DisconnectAfterChunks, c.Anthropic.MalformedChunk, c.Anthropic.RateLimitRPM, c.Anthropic.ReasoningTokens, c.Anthropic.ThinkingDelayMs,
+		c.Bedrock.Tokens, c.Bedrock.LatencyMs, c.Bedrock.StreamDelayMs, c.Bedrock.ErrorRate, c.Bedrock.ErrorStatus, c.Bedrock.TimeoutMs, c.Bedrock.DisconnectAfterChunks, c.Bedrock.MalformedChunk, c.Bedrock.RateLimitRPM, c.Bedrock.ReasoningTokens, c.Bedrock.ThinkingDelayMs,
 	)
 }

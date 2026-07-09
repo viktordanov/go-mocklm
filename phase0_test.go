@@ -414,7 +414,7 @@ func TestFailFirstNIsDeterministic(t *testing.T) {
 	// Config reset restarts the counter.
 	state.Reset()
 	cfgSnap, _ := state.Config()
-	state.Update(cfgSnap.OpenAI, cfgSnap.Anthropic, "")
+	state.Update(cfgSnap.OpenAI, cfgSnap.Anthropic, cfgSnap.Bedrock, "")
 	resp, err := postJSON(srv.URL+"/v1/chat/completions", openaiChatBody(false), nil)
 	if err != nil {
 		t.Fatalf("POST after reset failed: %v", err)

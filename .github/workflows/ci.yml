@@ -1,0 +1,44 @@
+# CI gate: the spec-sync drift tripwire must actually RUN, not skip.
+#
+# The nanollm checkout supplies the sha256-pinned OpenAPI specs the vendored
+# validator closure was extracted from. MOCKLM_REQUIRE_SPEC_SYNC=1 turns the
+# missing-spec-dir skip in spec_sync_test.go into a hard failure, so a green
+# run cannot silently mean "the drift tests did not execute".
+# MOCKLM_VALIDATE_RESPONSES=1 turns on the response self-validation closed
+# loop for every test request.
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: go-mocklm
+      # Pinned nanollm checkout for the spec-sync closure (private repo:
+      # supply a token with read access via the NANOLLM_CHECKOUT_TOKEN
+      # secret, or vendor the specs and point NANOLLM_SPEC_DIR at them).
+      - uses: actions/checkout@v4
+        with:
+          repository: viktordanov/nanollm
+          token: ${{ secrets.NANOLLM_CHECKOUT_TOKEN || github.token }}
+          path: nanollm
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-mocklm/go.mod
+      - name: go build
+        working-directory: go-mocklm
+        run: go build ./...
+      - name: go vet
+        working-directory: go-mocklm
+        run: go vet ./...
+      - name: go test (spec-sync gate + response self-validation on)
+        working-directory: go-mocklm
+        env:
+          NANOLLM_SPEC_DIR: ${{ github.workspace }}/nanollm/spec
+          MOCKLM_REQUIRE_SPEC_SYNC: "1"
+          MOCKLM_VALIDATE_RESPONSES: "1"
+        run: go test ./...

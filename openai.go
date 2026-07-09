@@ -62,6 +62,20 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 			return
 		}
 
+		// Scenario match — after body read + model decode (K1: the
+		// provider-global concurrency gate and limiter fetch above already
+		// ran; scenarios scope content+faults+capture only).
+		sc, scStatus, scMsg := matchScenario(state.Scenarios(), r, "openai", "chat", req.Model)
+		if scMsg != "" {
+			writeErrorResponse(w, &cfg, scStatus, "openai", errorTypeForStatus(scStatus, "openai"), scMsg)
+			return
+		}
+		var exact *ExactOutput
+		if sc != nil {
+			cfg = applyScenario(sc, r, rawBody, &cfg)
+			exact = sc.Output
+		}
+
 		if checkFaults(w, r, &cfg, limiter, state, "openai") {
 			return
 		}
@@ -116,9 +130,9 @@ func handleOpenAIChat(state *ServerState) http.HandlerFunc {
 
 		if req.Stream {
 			includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
-			handleOpenAIChatStream(r.Context(), w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput, includeUsage)
+			handleOpenAIChatStream(r.Context(), w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput, includeUsage, exact)
 		} else {
-			handleOpenAIChatNonStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput)
+			handleOpenAIChatNonStream(w, &cfg, id, model, words, promptTokens, outputTokens, toolName, toolInput, exact)
 		}
 	}
 }
@@ -183,7 +197,7 @@ func mockToolCalls(toolName string, toolInput map[string]any) []map[string]any {
 	}
 }
 
-func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any) {
+func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any, exact *ExactOutput) {
 	if cfg.ReasoningTokens > 0 {
 		completionTokens = len(words) + cfg.ReasoningTokens
 	}
@@ -191,6 +205,11 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 	content := joinContent(words)
 	if cfg.ContentText != "" {
 		content = strings.Join(words, " ")
+	}
+	if exact != nil {
+		// Exact output: Text verbatim, usage per the R9 rule.
+		content = exact.Text
+		completionTokens = exactOutputTokens(exact)
 	}
 
 	message := map[string]any{
@@ -232,7 +251,10 @@ func handleOpenAIChatNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, m
 	writeValidatedJSON(w, cfg, kindOpenAIChat, "openai chat completion", resp)
 }
 
-func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any, includeUsage bool) {
+func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, promptTokens, completionTokens int, toolName string, toolInput map[string]any, includeUsage bool, exact *ExactOutput) {
+	if exact != nil {
+		completionTokens = exactOutputTokens(exact)
+	}
 	sse := newSSEWriter(w)
 	sse.applyTransportFaults(ctx, cfg)
 	validate := shouldValidate(cfg) && !bypassesValidation(cfg)
@@ -315,9 +337,12 @@ func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *Pro
 		return
 	}
 
-	// Content chunks
-	for i, word := range words {
-		if checkStreamingFault(w, cfg, i, len(words)) {
+	// Content chunks: exact-output scenarios stream chunkExact slices of
+	// Output.Text verbatim (the delta boundary a decoder reassembles);
+	// generated words keep the historical decoration.
+	deltas := streamDeltas(cfg, words, exact)
+	for i, token := range deltas {
+		if checkStreamingFault(w, cfg, i, len(deltas)) {
 			return
 		}
 
@@ -333,20 +358,6 @@ func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *Pro
 			if !sleepWithPings(ctx, sse, delay, cfg.SseKeepaliveIntervalMs) {
 				return
 			}
-		}
-
-		token := word
-		if cfg.ContentText == "" {
-			if i == 0 {
-				// Capitalize first word
-				token = capitalize(token)
-			}
-			if i == len(words)-1 {
-				token += "."
-			}
-		}
-		if i != len(words)-1 {
-			token += " "
 		}
 
 		contentChunk := map[string]any{
@@ -404,8 +415,9 @@ func handleOpenAIChatStream(ctx context.Context, w http.ResponseWriter, cfg *Pro
 		}
 	}
 
-	// Adjust completion tokens for reasoning
-	if cfg.ReasoningTokens > 0 {
+	// Adjust completion tokens for reasoning (exact output already pinned
+	// its usage via the R9 rule)
+	if cfg.ReasoningTokens > 0 && exact == nil {
 		completionTokens = len(words) + cfg.ReasoningTokens
 	}
 

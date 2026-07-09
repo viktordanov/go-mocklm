@@ -37,3 +37,14 @@ rate_limit_rpm = 0
 # slow_header_ms = 0
 # max_concurrent = 0
 # sse_keepalive_interval_ms = 0
+
+# Bedrock Runtime Converse/ConverseStream (POST /model/{modelId}/converse[-stream]).
+# Plain model IDs only: ARNs / inference-profile IDs containing "/" do not
+# route through the {modelId} segment. No pinned Bedrock schema exists in the
+# spec-sync closure, so validate_responses does not cover these bodies.
+[bedrock]
+latency_ms = 100
+tokens = 20
+stream_delay_ms = 50
+error_rate = 0.0
+error_status = 500

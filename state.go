@@ -26,6 +26,7 @@ type ServerState struct {
 	initialCfg   Config
 	openaiRL     *RateLimiter
 	anthropicRL  *RateLimiter
+	bedrockRL    *RateLimiter
 	activePreset string
 
 	// Request recording
@@ -35,6 +36,7 @@ type ServerState struct {
 	// Concurrency tracking
 	openaiActive    atomic.Int32
 	anthropicActive atomic.Int32
+	bedrockActive   atomic.Int32
 
 	// Per-provider request (attempt) counters: drive fail_first_n and
 	// attempt_faults indexing and back the /admin/request-count
@@ -42,6 +44,14 @@ type ServerState struct {
 	// starts counting from zero.
 	openaiAttempts    atomic.Int64
 	anthropicAttempts atomic.Int64
+	bedrockAttempts   atomic.Int64
+
+	// scenarios is the Phase-3a registry. Deliberately NOT touched by
+	// Update/Reset — scenarios are test fixtures with independent
+	// lifetimes (DELETE /admin/scenarios clears them). Note (R6) the
+	// provider-global attempt counters their attempt_faults index off ARE
+	// zeroed by Update/Reset.
+	scenarios *ScenarioStore
 }
 
 // NewServerState creates a ServerState from the initial config and builds rate limiters.
@@ -49,10 +59,16 @@ func NewServerState(cfg *Config) *ServerState {
 	s := &ServerState{
 		cfg:        *cfg,
 		initialCfg: *cfg,
+		scenarios:  newScenarioStore(),
 	}
 	s.rebuildLimiters()
 
 	return s
+}
+
+// Scenarios returns the scenario registry.
+func (s *ServerState) Scenarios() *ScenarioStore {
+	return s.scenarios
 }
 
 // OpenAI returns a snapshot of the OpenAI provider config and its rate limiter.
@@ -71,6 +87,14 @@ func (s *ServerState) Anthropic() (ProviderConfig, *RateLimiter) {
 	return s.cfg.Anthropic, s.anthropicRL
 }
 
+// Bedrock returns a snapshot of the Bedrock provider config and its rate limiter.
+func (s *ServerState) Bedrock() (ProviderConfig, *RateLimiter) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.cfg.Bedrock, s.bedrockRL
+}
+
 // Config returns a snapshot of the full config and the active preset name.
 func (s *ServerState) Config() (Config, string) {
 	s.mu.RLock()
@@ -79,13 +103,16 @@ func (s *ServerState) Config() (Config, string) {
 	return s.cfg, s.activePreset
 }
 
-// Update replaces the provider configs, rebuilds rate limiters, and records the preset name.
-func (s *ServerState) Update(openai, anthropic ProviderConfig, presetName string) {
+// Update replaces the provider configs, rebuilds rate limiters, and records
+// the preset name. Scenarios (the Phase-3a registry) survive — only the
+// attempt counters they may index off are zeroed.
+func (s *ServerState) Update(openai, anthropic, bedrock ProviderConfig, presetName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.cfg.OpenAI = openai
 	s.cfg.Anthropic = anthropic
+	s.cfg.Bedrock = bedrock
 	s.activePreset = presetName
 	s.rebuildLimiters()
 	s.ResetAttempts()
@@ -98,31 +125,45 @@ func (s *ServerState) Reset() {
 
 	s.cfg.OpenAI = s.initialCfg.OpenAI
 	s.cfg.Anthropic = s.initialCfg.Anthropic
+	s.cfg.Bedrock = s.initialCfg.Bedrock
 	s.activePreset = ""
 	s.rebuildLimiters()
 	s.ResetAttempts()
+}
+
+// attemptsFor resolves the provider's attempt counter. Unknown providers
+// panic loudly (R2): a silent else-branch here once aliased a third
+// provider onto anthropic's counter — never again.
+func (s *ServerState) attemptsFor(provider string) *atomic.Int64 {
+	switch provider {
+	case "openai":
+		return &s.openaiAttempts
+	case "anthropic":
+		return &s.anthropicAttempts
+	case "bedrock":
+		return &s.bedrockAttempts
+	}
+	panic("mocklm: unknown provider " + provider)
 }
 
 // NextAttempt returns the 1-based sequence number of this request for the
 // provider's attempt counter (fail_first_n, attempt_faults, and the
 // /admin/request-count oracle all share it).
 func (s *ServerState) NextAttempt(provider string) int64 {
-	if provider == "openai" {
-		return s.openaiAttempts.Add(1)
-	}
-	return s.anthropicAttempts.Add(1)
+	return s.attemptsFor(provider).Add(1)
 }
 
 // AttemptCounts returns the per-provider request counts since the last
 // reset/config update.
-func (s *ServerState) AttemptCounts() (openai, anthropic int64) {
-	return s.openaiAttempts.Load(), s.anthropicAttempts.Load()
+func (s *ServerState) AttemptCounts() (openai, anthropic, bedrock int64) {
+	return s.openaiAttempts.Load(), s.anthropicAttempts.Load(), s.bedrockAttempts.Load()
 }
 
 // ResetAttempts zeroes the per-provider request counters.
 func (s *ServerState) ResetAttempts() {
 	s.openaiAttempts.Store(0)
 	s.anthropicAttempts.Store(0)
+	s.bedrockAttempts.Store(0)
 }
 
 // maxRecordedRequests caps the in-memory recording buffer; the oldest
@@ -168,6 +209,12 @@ func (s *ServerState) rebuildLimiters() {
 	} else {
 		s.anthropicRL = nil
 	}
+
+	if s.cfg.Bedrock.RateLimitRPM > 0 {
+		s.bedrockRL = newRateLimiter(s.cfg.Bedrock.RateLimitRPM)
+	} else {
+		s.bedrockRL = nil
+	}
 }
 
 // AcquireConcurrency attempts to acquire a concurrency slot for the provider.
@@ -196,16 +243,29 @@ func (s *ServerState) ReleaseConcurrency(provider string) {
 	counter.Add(-1)
 }
 
+// counterFor resolves the provider's active-concurrency counter. Unknown
+// providers panic loudly (R2): the old openai-else-anthropic branch would
+// have silently aliased bedrock onto anthropic's concurrency gate.
 func (s *ServerState) counterFor(provider string) *atomic.Int32 {
-	if provider == "openai" {
+	switch provider {
+	case "openai":
 		return &s.openaiActive
+	case "anthropic":
+		return &s.anthropicActive
+	case "bedrock":
+		return &s.bedrockActive
 	}
-	return &s.anthropicActive
+	panic("mocklm: unknown provider " + provider)
 }
 
 func (s *ServerState) providerConfig(provider string) (ProviderConfig, *RateLimiter) {
-	if provider == "openai" {
+	switch provider {
+	case "openai":
 		return s.OpenAI()
+	case "anthropic":
+		return s.Anthropic()
+	case "bedrock":
+		return s.Bedrock()
 	}
-	return s.Anthropic()
+	panic("mocklm: unknown provider " + provider)
 }

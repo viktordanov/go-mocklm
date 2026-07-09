@@ -73,12 +73,27 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 			return
 		}
 
+		// Scenario match — after body read + model decode (K1: the
+		// provider-global concurrency gate and limiter fetch above already
+		// ran; scenarios scope content+faults+capture only).
+		sc, scStatus, scMsg := matchScenario(state.Scenarios(), r, "anthropic", "messages", req.Model)
+		if scMsg != "" {
+			writeErrorResponse(w, &cfg, scStatus, "anthropic", errorTypeForStatus(scStatus, "anthropic"), scMsg)
+			return
+		}
+		var exact *ExactOutput
+		if sc != nil {
+			cfg = applyScenario(sc, r, rawBody, &cfg)
+			exact = sc.Output
+		}
+
 		if checkFaults(w, r, &cfg, limiter, state, "anthropic") {
 			return
 		}
 
-		// Strict mode: contract-oracle validation against the real API's
-		// request schema (after fault injection, like a real gateway).
+		// Strict mode: the Anthropic request-shape checker (bounded) —
+		// a manual-allowlist shape check, not a full request-schema
+		// validator (after fault injection, like a real gateway).
 		if cfg.Strict {
 			if msg := validateAnthropicStrict(rawBody); msg != "" {
 				writeErrorResponse(w, &cfg, 400, "anthropic", "invalid_request_error", msg)
@@ -148,9 +163,9 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 		}
 
 		if req.Stream {
-			handleAnthropicStream(r.Context(), w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput)
+			handleAnthropicStream(r.Context(), w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput, exact)
 		} else {
-			handleAnthropicNonStream(w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput)
+			handleAnthropicNonStream(w, &cfg, id, model, words, inputTokens, outputTokens, toolName, toolInput, exact)
 		}
 	}
 }
@@ -194,7 +209,7 @@ func anthropicStopReason(cfg *ProviderConfig) string {
 	return "end_turn"
 }
 
-func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
+func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any, exact *ExactOutput) {
 	// Tool use response mode: return text + tool_use content blocks echoing
 	// the first requested tool.
 	if cfg.ToolUseResponse {
@@ -225,10 +240,23 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 	if cfg.ContentText != "" {
 		content = strings.Join(words, " ")
 	}
+	if exact != nil {
+		// Exact output: Text verbatim, usage per the R9 rule.
+		content = exact.Text
+		outputTokens = exactOutputTokens(exact)
+	}
 
 	contentBlocks := []map[string]any{}
 
-	if cfg.ReasoningTokens > 0 {
+	if exact != nil && exact.Thinking != "" {
+		// Exact thinking (K17 opt-in): the scenario owns the thinking block
+		// verbatim; reasoning_tokens does not add a second one.
+		contentBlocks = append(contentBlocks, map[string]any{
+			"type":      "thinking",
+			"thinking":  exact.Thinking,
+			"signature": "sig_mock",
+		})
+	} else if cfg.ReasoningTokens > 0 {
 		thinkingWordCount := cfg.ReasoningTokens / 3
 		if thinkingWordCount < 5 {
 			thinkingWordCount = 5
@@ -266,7 +294,10 @@ func handleAnthropicNonStream(w http.ResponseWriter, cfg *ProviderConfig, id, mo
 	writeValidatedJSON(w, cfg, kindAnthropicMessage, "anthropic message", resp)
 }
 
-func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any) {
+func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, inputTokens, outputTokens int, toolName string, toolInput map[string]any, exact *ExactOutput) {
+	if exact != nil {
+		outputTokens = exactOutputTokens(exact)
+	}
 	sse := newSSEWriter(w)
 	sse.applyTransportFaults(ctx, cfg)
 	validate := shouldValidate(cfg) && !bypassesValidation(cfg)
@@ -346,13 +377,32 @@ func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 
 	textBlockIndex := 0
 
-	// Thinking block (if reasoning tokens configured)
-	if cfg.ReasoningTokens > 0 {
-		thinkingWordCount := cfg.ReasoningTokens / 3
-		if thinkingWordCount < 5 {
-			thinkingWordCount = 5
+	// Thinking block: exact thinking (K17 opt-in — the scenario owns the
+	// block verbatim, sliced by chunkExact) or generated from
+	// reasoning_tokens.
+	exactThinking := exact != nil && exact.Thinking != ""
+	if exactThinking || cfg.ReasoningTokens > 0 {
+		var thinkChunks []string
+		if exactThinking {
+			thinkChunks = chunkExact(exact.Thinking, exact.Chunking)
+		} else {
+			thinkingWordCount := cfg.ReasoningTokens / 3
+			if thinkingWordCount < 5 {
+				thinkingWordCount = 5
+			}
+			thinkingWords := generateWords(thinkingWordCount)
+			for i := 0; i < len(thinkingWords); i += 5 {
+				end := i + 5
+				if end > len(thinkingWords) {
+					end = len(thinkingWords)
+				}
+				chunk := strings.Join(thinkingWords[i:end], " ")
+				if i+5 < len(thinkingWords) {
+					chunk += " "
+				}
+				thinkChunks = append(thinkChunks, chunk)
+			}
 		}
-		thinkingWords := generateWords(thinkingWordCount)
 
 		// content_block_start for thinking
 		thinkStart, _ := json.Marshal(map[string]any{
@@ -366,17 +416,7 @@ func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 			return
 		}
 
-		// Stream thinking in ~5 word chunks
-		for i := 0; i < len(thinkingWords); i += 5 {
-			end := i + 5
-			if end > len(thinkingWords) {
-				end = len(thinkingWords)
-			}
-			chunk := strings.Join(thinkingWords[i:end], " ")
-			if i+5 < len(thinkingWords) {
-				chunk += " "
-			}
-
+		for _, chunk := range thinkChunks {
 			delay := cfg.StreamDelayMs
 			if cfg.StreamDelayJitterMs > 0 {
 				jitter := rand.Intn(cfg.StreamDelayJitterMs*2+1) - cfg.StreamDelayJitterMs
@@ -439,9 +479,12 @@ func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		return
 	}
 
-	// content_block_delta (word by word)
-	for i, word := range words {
-		if checkStreamingFault(w, cfg, i, len(words)) {
+	// content_block_delta: exact-output scenarios stream chunkExact slices
+	// of Output.Text verbatim; generated words keep the historical
+	// decoration.
+	deltas := streamDeltas(cfg, words, exact)
+	for i, token := range deltas {
+		if checkStreamingFault(w, cfg, i, len(deltas)) {
 			return
 		}
 
@@ -457,19 +500,6 @@ func handleAnthropicStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 			if !sleepWithPings(ctx, sse, delay, cfg.SseKeepaliveIntervalMs) {
 				return
 			}
-		}
-
-		token := word
-		if cfg.ContentText == "" {
-			if i == 0 {
-				token = capitalize(token)
-			}
-			if i == len(words)-1 {
-				token += "."
-			}
-		}
-		if i != len(words)-1 {
-			token += " "
 		}
 
 		delta, _ := json.Marshal(map[string]any{

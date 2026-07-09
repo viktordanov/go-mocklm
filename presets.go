@@ -1,11 +1,15 @@
 package main
 
-// Preset is a named pair of provider configs with a human-readable description.
+// Preset is a named set of provider configs with a human-readable
+// description. Builtins leave Bedrock zero-valued, which activates as the
+// healthy defaults (applyProviderDefaults) — activating any preset resets
+// bedrock to healthy.
 type Preset struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	OpenAI      ProviderConfig `json:"openai"`
 	Anthropic   ProviderConfig `json:"anthropic"`
+	Bedrock     ProviderConfig `json:"bedrock"`
 }
 
 func builtinPresets() map[string]Preset {

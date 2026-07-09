@@ -17,6 +17,12 @@ func handleOpenAICompletions(state *ServerState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg, limiter := state.OpenAI()
 
+		// R4: scenarios are not honored on the legacy completions surface —
+		// a targeting header is a loud 400, not a silent no-op.
+		if rejectScenarioHeaderUnwired(w, r, &cfg, "openai") {
+			return
+		}
+
 		allowed, acquired := state.AcquireConcurrency("openai")
 		if !allowed {
 			writeErrorResponse(w, &cfg, 503, "openai", "server_error", "Too many concurrent requests")

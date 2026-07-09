@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 )
 
 // handleAdminGetConfig returns the current config and active preset.
@@ -14,6 +15,7 @@ func handleAdminGetConfig(state *ServerState) http.HandlerFunc {
 			"active_preset": preset,
 			"openai":        cfg.OpenAI,
 			"anthropic":     cfg.Anthropic,
+			"bedrock":       cfg.Bedrock,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -27,6 +29,7 @@ func handleAdminPutConfig(state *ServerState) http.HandlerFunc {
 		var body struct {
 			OpenAI    ProviderConfig `json:"openai"`
 			Anthropic ProviderConfig `json:"anthropic"`
+			Bedrock   ProviderConfig `json:"bedrock"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeErrorResponse(w, nil, 400, "admin", "invalid_request_error", "Invalid JSON: "+err.Error())
@@ -35,7 +38,8 @@ func handleAdminPutConfig(state *ServerState) http.HandlerFunc {
 
 		applyProviderDefaults(&body.OpenAI)
 		applyProviderDefaults(&body.Anthropic)
-		state.Update(body.OpenAI, body.Anthropic, "custom")
+		applyProviderDefaults(&body.Bedrock)
+		state.Update(body.OpenAI, body.Anthropic, body.Bedrock, "custom")
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -60,9 +64,11 @@ func handleAdminPutPreset(state *ServerState) http.HandlerFunc {
 
 		openai := preset.OpenAI
 		anthropic := preset.Anthropic
+		bedrock := preset.Bedrock
 		applyProviderDefaults(&openai)
 		applyProviderDefaults(&anthropic)
-		state.Update(openai, anthropic, name)
+		applyProviderDefaults(&bedrock)
+		state.Update(openai, anthropic, bedrock, name)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -117,12 +123,17 @@ func handleAdminClearRequests(state *ServerState) http.HandlerFunc {
 // and attempt_faults.
 func handleAdminGetRequestCount(state *ServerState) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
-		openai, anthropic := state.AttemptCounts()
+		openai, anthropic, bedrock := state.AttemptCounts()
 
+		// The bedrock key is ADDITIVE to the historical {openai, anthropic}
+		// response shape (K8): consumers ignoring unknown keys are
+		// unaffected; a consumer asserting the exact two-key set must relax
+		// that assertion.
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"openai":    openai,
 			"anthropic": anthropic,
+			"bedrock":   bedrock,
 		})
 	}
 }
@@ -137,6 +148,40 @@ func handleAdminResetRequestCount(state *ServerState) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"status": "reset",
+		})
+	}
+}
+
+// handleAdminGetFaults returns the machine-readable fault-mode catalog:
+// per mode, its phase, WHEN knobs, params, whether it needs
+// validate_responses:false, and its Bedrock dialect where it differs.
+func handleAdminGetFaults() http.HandlerFunc {
+	catalog := faultCatalog()
+
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"faults": catalog,
+		})
+	}
+}
+
+// handleAdminGetFaultPresets lists the named fault presets — ProviderConfig
+// fragments carrying only fault-surface knobs, registerable straight into a
+// scenario's config (POST /admin/scenarios {"fault_preset": name}).
+func handleAdminGetFaultPresets() http.HandlerFunc {
+	presets := builtinFaultPresets()
+
+	list := make([]FaultPreset, 0, len(presets))
+	for _, p := range presets {
+		list = append(list, p)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"fault_presets": list,
 		})
 	}
 }

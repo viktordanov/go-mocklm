@@ -5,12 +5,14 @@ import (
 	"fmt"
 )
 
-// Strict-mode validation for the Anthropic provider (`strict = true`).
+// The Anthropic request-shape checker (bounded) — `strict = true`.
 //
 // The default (lenient) mode accepts nearly anything — it sizes mock output
-// and never validates schemas. Strict mode makes mocklm a contract oracle:
-// requests the real API would 400 get a 400 here, so a proxy's transform
-// output can be validated end-to-end without live API calls.
+// and never validates schemas. Strict mode adds a bounded, Anthropic-only,
+// manual-allowlist shape check on the request side: requests the real API
+// would 400 get a 400 here, so a proxy's transform output can be checked
+// end-to-end without live API calls. It is NOT a general request-schema
+// validator.
 //
 // Validation depth (documented, deliberately bounded):
 //   - top-level: unknown fields rejected (additionalProperties: false),

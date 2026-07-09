@@ -59,6 +59,19 @@ func (s *sseWriter) applyTransportFaults(ctx context.Context, cfg *ProviderConfi
 	s.coalesce = cfg.CoalesceFrames
 }
 
+// bodyBytes implements streamSink: total body bytes written so far, backing
+// the after_bytes fault-trigger knob.
+func (s *sseWriter) bodyBytes() int {
+	return s.bytes
+}
+
+// writeCorrupt implements streamSink: a corrupt non-JSON SSE data frame
+// (the malformed_chunk fault), written raw — never routed through the
+// validating frameWriter, being invalid is the point.
+func (s *sseWriter) writeCorrupt() {
+	s.writeData("{INVALID JSON CORRUPT")
+}
+
 // writeData writes an SSE data-only line (OpenAI format).
 func (s *sseWriter) writeData(data string) {
 	s.writeFrame("data: " + data + s.eol + s.eol)

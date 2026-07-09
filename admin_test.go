@@ -167,6 +167,7 @@ func TestAdminReset(t *testing.T) {
 	state.Update(
 		ProviderConfig{Tokens: 99, ErrorRate: 1.0, ErrorStatus: 503},
 		ProviderConfig{Tokens: 99, ErrorStatus: 500},
+		ProviderConfig{Tokens: 99, ErrorStatus: 500},
 		"test",
 	)
 
@@ -265,9 +266,11 @@ func TestRuntimeConfigSwitch(t *testing.T) {
 	preset := presets["openai-disconnect"]
 	openai := preset.OpenAI
 	anthropic := preset.Anthropic
+	bedrock := preset.Bedrock
 	applyProviderDefaults(&openai)
 	applyProviderDefaults(&anthropic)
-	state.Update(openai, anthropic, "openai-disconnect")
+	applyProviderDefaults(&bedrock)
+	state.Update(openai, anthropic, bedrock, "openai-disconnect")
 
 	// Streaming request should disconnect early (no [DONE])
 	resp, err = postJSON(srv.URL+"/v1/chat/completions", openaiChatBody(true), nil)

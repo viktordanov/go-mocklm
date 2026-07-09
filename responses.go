@@ -15,6 +15,13 @@ func handleOpenAIResponses(state *ServerState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg, limiter := state.OpenAI()
 
+		// R4: scenarios are not honored here (this surface word-generates
+		// and would silently lose exact content) — a targeting header is a
+		// loud 400, not a silent no-op.
+		if rejectScenarioHeaderUnwired(w, r, &cfg, "openai") {
+			return
+		}
+
 		// Max concurrent check
 		allowed, acquired := state.AcquireConcurrency("openai")
 		if !allowed {
@@ -142,6 +149,27 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 	}
 
 	sse := newSSEWriter(w)
+	sse.applyTransportFaults(ctx, cfg)
+
+	// The Responses stream is in the FAULT loop (transport faults +
+	// stream-fault injector), but response-body schema validation here is
+	// best-effort only: no Responses root is in the vendored spec-sync
+	// closure, so payloads are NOT checked against a pinned schema (see
+	// validator.go — the closure mirrors nanollm's oracle roots).
+	writeFrame := func(event, data string) bool {
+		sse.writeEvent(event, data)
+		return false
+	}
+	inj := newStreamFaultInjector(ctx, cfg.streamFaults, w, sse, writeFrame)
+
+	// emit writes one real stream event, then gives the fault injector its
+	// shot at the just-written frame. Returns true when the stream is over.
+	emit := func(event, data string) bool {
+		if writeFrame(event, data) {
+			return true
+		}
+		return inj.afterFrame(event)
+	}
 
 	// TTFT delay
 	if cfg.TtftMs > 0 {
@@ -163,7 +191,9 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		"output":     []any{},
 	}
 	data, _ := json.Marshal(createdResp)
-	sse.writeEvent("response.created", string(data))
+	if emit("response.created", string(data)) {
+		return
+	}
 
 	// response.output_item.added — message item
 	msgItem := map[string]any{
@@ -179,7 +209,9 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		"item":         msgItem,
 	}
 	data, _ = json.Marshal(itemAdded)
-	sse.writeEvent("response.output_item.added", string(data))
+	if emit("response.output_item.added", string(data)) {
+		return
+	}
 
 	// response.content_part.added
 	contentPart := map[string]any{
@@ -193,7 +225,9 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		"part":          contentPart,
 	}
 	data, _ = json.Marshal(partAdded)
-	sse.writeEvent("response.content_part.added", string(data))
+	if emit("response.content_part.added", string(data)) {
+		return
+	}
 
 	// response.output_text.delta — word by word
 	for i, word := range words {
@@ -232,7 +266,9 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 			"delta":         token,
 		}
 		data, _ = json.Marshal(delta)
-		sse.writeEvent("response.output_text.delta", string(data))
+		if emit("response.output_text.delta", string(data)) {
+			return
+		}
 	}
 
 	// response.output_text.done
@@ -244,7 +280,9 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		"text":          fullText,
 	}
 	data, _ = json.Marshal(textDone)
-	sse.writeEvent("response.output_text.done", string(data))
+	if emit("response.output_text.done", string(data)) {
+		return
+	}
 
 	// response.content_part.done
 	partDone := map[string]any{
@@ -257,7 +295,9 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		},
 	}
 	data, _ = json.Marshal(partDone)
-	sse.writeEvent("response.content_part.done", string(data))
+	if emit("response.content_part.done", string(data)) {
+		return
+	}
 
 	// response.output_item.done
 	doneItem := map[string]any{
@@ -274,7 +314,9 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		},
 	}
 	data, _ = json.Marshal(doneItem)
-	sse.writeEvent("response.output_item.done", string(data))
+	if emit("response.output_item.done", string(data)) {
+		return
+	}
 
 	// response.completed — full response with usage
 	outputItems := buildOutputItems(cfg, words)
@@ -295,7 +337,11 @@ func handleResponsesStream(ctx context.Context, w http.ResponseWriter, cfg *Prov
 		},
 	}
 	data, _ = json.Marshal(completedResp)
-	sse.writeEvent("response.completed", string(data))
+	if emit("response.completed", string(data)) {
+		return
+	}
+	// Coalesced-frame mode (A3): the buffered tail goes out with the stream.
+	sse.flushPending()
 }
 
 func buildOutputItems(cfg *ProviderConfig, words []string) []map[string]any {
