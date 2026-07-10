@@ -688,8 +688,12 @@ event: response.completed
 ## Spec-Sync & Response Validation
 
 go-mocklm vendors the **response-side JSON-Schema closure** of the same
-sha256-pinned OpenAPI specs nanollm's Rust oracle types are generated from
-(`../nanollm/spec/*.json`):
+sha256-pinned OpenAPI specs nanollm's Rust oracle types are generated from.
+The source specs themselves are vendored in-repo under
+`testdata/nanollm-spec/` (`openai-openapi.json`, `anthropic-openapi.json`
+and their `.sha256` pins — exact bytes), so the drift tripwire and CI are
+fully self-contained with no cross-repo checkout of the (private) nanollm
+repo:
 
 - `spec/openai-responses.schema.json` — 13 schemas reachable from
   `CreateChatCompletionResponse`, `CreateChatCompletionStreamResponse`,
@@ -697,6 +701,8 @@ sha256-pinned OpenAPI specs nanollm's Rust oracle types are generated from
 - `spec/anthropic-responses.schema.json` — 82 schemas reachable from
   `Message`, `MessageStreamEvent`, `ErrorResponse`
 - `spec/pins.json` — sha256 of the source specs at extraction time
+- `testdata/nanollm-spec/*.json` — the vendored source specs the closures
+  were extracted from
 
 Regenerate with `go run ./cmd/specsync` (or `go generate ./...`). The
 extractor ports exactly two normalization rules from nanollm's
@@ -705,15 +711,38 @@ extractor ports exactly two normalization rules from nanollm's
 independently under real validation), and `additionalProperties: false`
 injection on the two OpenAI response roots (without it, OpenAI response
 validation is unknown-field-blind). `spec_sync_test.go` fails when the
-recorded pins diverge from `../nanollm/spec` or when the vendored files
-drift from a fresh extraction.
+recorded pins diverge from the vendored source specs or when the vendored
+closures drift from a fresh extraction.
 
-The drift tests normally **skip** when the nanollm spec dir is absent (a
-repo-only checkout still runs the rest of the suite). Setting
+By default the drift tests read the vendored specs under
+`testdata/nanollm-spec/`, so they run in any bare checkout. Set
+`NANOLLM_SPEC_DIR` (e.g. `../nanollm/spec`) to check for **live drift**
+against a working nanollm checkout instead.
+
+The drift tests **skip** only when the spec dir is genuinely absent (e.g. a
+stray `NANOLLM_SPEC_DIR` pointing nowhere). Setting
 `MOCKLM_REQUIRE_SPEC_SYNC=1` turns that skip into a **hard failure** — the
-CI gate (`.github/workflows/ci.yml` supplies a pinned nanollm checkout and
-sets it) so a green run cannot silently mean "the drift tripwire did not
-run".
+CI gate (`.github/workflows/ci.yml` sets it) so a green run cannot silently
+mean "the drift tripwire did not run". Because the source specs are vendored
+in-repo, that gate runs and passes in a fresh clone with no `../nanollm`
+present.
+
+### Bumping the vendored specs
+
+When nanollm's specs move, re-vendor them deliberately and review the diff:
+
+```sh
+scripts/refresh-specs.sh              # copies from ../nanollm/spec
+scripts/refresh-specs.sh /path/to/nanollm/spec
+```
+
+This re-copies the source specs (exact bytes) into `testdata/nanollm-spec/`
+and regenerates the closures + `spec/pins.json` via `go run ./cmd/specsync`.
+Then verify with:
+
+```sh
+env -u NANOLLM_SPEC_DIR MOCKLM_REQUIRE_SPEC_SYNC=1 MOCKLM_VALIDATE_RESPONSES=1 go test ./...
+```
 
 With `validate_responses` on (knob or `MOCKLM_VALIDATE_RESPONSES=1` env
 default), every body on the closure's surfaces is validated (full JSON

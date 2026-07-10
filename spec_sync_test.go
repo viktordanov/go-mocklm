@@ -20,23 +20,33 @@ import (
 // when either side moves without the other: nanollm bumps a spec (pins
 // diverge) or someone edits the vendored files by hand (regen drift).
 
-// nanollmSpecDir resolves the sibling nanollm spec directory, honouring
-// NANOLLM_SPEC_DIR for non-sibling checkouts.
+// vendoredSpecDir is the in-repo copy of nanollm's pinned OpenAPI specs the
+// vendored validator closures were extracted from. Vendoring keeps CI fully
+// self-contained: the drift tripwire runs against these bytes with no
+// cross-repo checkout of the (private) nanollm repo. Refresh with
+// scripts/refresh-specs.sh when nanollm's specs move.
+const vendoredSpecDir = "testdata/nanollm-spec"
+
+// nanollmSpecDir resolves the nanollm spec directory. It defaults to the
+// vendored in-repo copy so the drift tripwire runs non-skipping in a fresh
+// clone / CI with no sibling ../nanollm present; set NANOLLM_SPEC_DIR to
+// point at a live checkout (e.g. ../nanollm/spec) for a live-drift check.
 //
-// A missing dir normally skips (a repo-only checkout can still run the rest
-// of the suite), but with MOCKLM_REQUIRE_SPEC_SYNC set the skip becomes a
-// hard failure — the CI gate that keeps a green run from silently meaning
-// "the drift tripwire DID NOT RUN".
+// A missing dir normally skips (so a stray NANOLLM_SPEC_DIR override can't
+// fail the whole suite), but with MOCKLM_REQUIRE_SPEC_SYNC set the skip
+// becomes a hard failure — the CI gate that keeps a green run from silently
+// meaning "the drift tripwire DID NOT RUN". Since the vendored dir ships in
+// the repo, that gate runs and passes in a bare checkout.
 func nanollmSpecDir(t *testing.T) string {
 	t.Helper()
 	dir := os.Getenv("NANOLLM_SPEC_DIR")
 	if dir == "" {
-		dir = "../nanollm/spec"
+		dir = vendoredSpecDir
 	}
 	if _, err := os.Stat(dir); err != nil {
 		if envTruthy(os.Getenv("MOCKLM_REQUIRE_SPEC_SYNC")) {
 			t.Fatalf("MOCKLM_REQUIRE_SPEC_SYNC is set but the nanollm spec dir was not found at %s "+
-				"(set NANOLLM_SPEC_DIR): %v — the spec-sync drift tripwire MUST run in this mode", dir, err)
+				"(vendored copy missing? set NANOLLM_SPEC_DIR): %v — the spec-sync drift tripwire MUST run in this mode", dir, err)
 		}
 		t.Skipf("nanollm spec dir not found at %s (set NANOLLM_SPEC_DIR): %v — "+
 			"the spec-sync drift tripwire DID NOT RUN", dir, err)
