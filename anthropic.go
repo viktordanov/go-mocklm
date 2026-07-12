@@ -53,6 +53,7 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 			Provider:  "anthropic",
 			Method:    r.Method,
 			Path:      r.URL.Path,
+			Proto:     r.Proto,
 			Headers:   headers,
 			Body:      json.RawMessage(rawBody),
 		})
@@ -87,6 +88,9 @@ func handleAnthropicMessages(state *ServerState) http.HandlerFunc {
 			exact = sc.Output
 		}
 
+		if rejectLeakedCacheControl(w, &cfg, "anthropic", rawBody) {
+			return
+		}
 		if checkFaults(w, r, &cfg, limiter, state, "anthropic") {
 			return
 		}

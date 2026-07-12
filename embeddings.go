@@ -45,6 +45,7 @@ func handleOpenAIEmbeddings(state *ServerState) http.HandlerFunc {
 			Provider:  "openai",
 			Method:    r.Method,
 			Path:      r.URL.Path,
+			Proto:     r.Proto,
 			Headers:   headers,
 			Body:      json.RawMessage(rawBody),
 		})
@@ -58,6 +59,9 @@ func handleOpenAIEmbeddings(state *ServerState) http.HandlerFunc {
 			return
 		}
 
+		if rejectLeakedCacheControl(w, &cfg, "openai", rawBody) {
+			return
+		}
 		if checkFaults(w, r, &cfg, limiter, state, "openai") {
 			return
 		}

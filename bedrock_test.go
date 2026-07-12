@@ -16,7 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
-// --- Phase 3c: Bedrock Converse/ConverseStream — eventstream framing,
+// --- Bedrock Converse/ConverseStream — eventstream framing,
 // SDK-decode to the typed ConverseStreamOutput union (K10), both error
 // channels, third-provider counters (R2), scenario exact output as the 4th
 // emit path (K15). All hermetic: the aws-sdk-go-v2 client talks to the

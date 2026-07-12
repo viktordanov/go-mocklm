@@ -13,8 +13,13 @@ type RecordedRequest struct {
 	Provider  string                 `json:"provider"`
 	Method    string                 `json:"method"`
 	Path      string                 `json:"path"`
-	Headers   map[string]string      `json:"headers"`
-	Body      json.RawMessage        `json:"body"`
+	// Proto is r.Proto — "HTTP/2.0" when the client negotiated h2 over the
+	// TLS lane's ALPN, "HTTP/1.1" otherwise. The transport-observation
+	// oracle: assert the gateway actually spoke the protocol it claims.
+	// Additive key; consumers ignoring unknown keys are unaffected.
+	Proto   string            `json:"proto,omitempty"`
+	Headers map[string]string `json:"headers"`
+	Body    json.RawMessage   `json:"body"`
 }
 
 // ServerState holds the mutable server configuration protected by a RWMutex.
@@ -38,19 +43,22 @@ type ServerState struct {
 	anthropicActive atomic.Int32
 	bedrockActive   atomic.Int32
 
-	// Per-provider request (attempt) counters: drive fail_first_n and
-	// attempt_faults indexing and back the /admin/request-count
-	// introspection oracle. Reset on Update/Reset so a fresh fault scenario
-	// starts counting from zero.
+	// Per-provider request (attempt) counters: back the
+	// /admin/request-count introspection oracle (counting ALL traffic,
+	// scenario-matched included) and drive fail_first_n / attempt_faults
+	// indexing for provider- and header-level configs. Matched scenarios
+	// index their own per-scenario counters instead (scenario.go). Reset
+	// on Update/Reset so a fresh provider fault config starts counting
+	// from zero.
 	openaiAttempts    atomic.Int64
 	anthropicAttempts atomic.Int64
 	bedrockAttempts   atomic.Int64
 
-	// scenarios is the Phase-3a registry. Deliberately NOT touched by
+	// scenarios is the scenario registry. Deliberately NOT touched by
 	// Update/Reset — scenarios are test fixtures with independent
-	// lifetimes (DELETE /admin/scenarios clears them). Note (R6) the
-	// provider-global attempt counters their attempt_faults index off ARE
-	// zeroed by Update/Reset.
+	// lifetimes (DELETE /admin/scenarios clears them), and their
+	// per-scenario fault-attempt counters survive a provider reset too
+	// (R6): /admin/reset never re-arms a scenario's attempt faults.
 	scenarios *ScenarioStore
 }
 
@@ -104,8 +112,9 @@ func (s *ServerState) Config() (Config, string) {
 }
 
 // Update replaces the provider configs, rebuilds rate limiters, and records
-// the preset name. Scenarios (the Phase-3a registry) survive — only the
-// attempt counters they may index off are zeroed.
+// the preset name. Scenarios (the scenario registry) survive untouched —
+// only the provider attempt counters are zeroed; per-scenario fault-attempt
+// counters are the scenarios' own state.
 func (s *ServerState) Update(openai, anthropic, bedrock ProviderConfig, presetName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -147,8 +156,9 @@ func (s *ServerState) attemptsFor(provider string) *atomic.Int64 {
 }
 
 // NextAttempt returns the 1-based sequence number of this request for the
-// provider's attempt counter (fail_first_n, attempt_faults, and the
-// /admin/request-count oracle all share it).
+// provider's attempt counter — the /admin/request-count oracle, and the
+// fail_first_n / attempt_faults index for provider- and header-level
+// configs (matched scenarios index their own counter, scenario.go).
 func (s *ServerState) NextAttempt(provider string) int64 {
 	return s.attemptsFor(provider).Add(1)
 }

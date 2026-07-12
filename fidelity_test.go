@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// --- Phase 0: spec-shape fidelity (G3/G8/G9/G10, G1/G2 gating) +
+// --- Spec-shape fidelity (G3/G8/G9/G10, G1/G2 gating) +
 // harness knobs (X-MockLM-Fault, fail_first_n, disconnect_after_event) ---
 
 // collectDataLines reads an OpenAI-style SSE stream and returns the payload

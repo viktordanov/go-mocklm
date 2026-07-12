@@ -18,8 +18,8 @@ type chatMessage struct {
 // Lenient by design: ANY JSON shape is accepted and approximated — this
 // sizes mock output, it does NOT validate request schemas. A request the
 // real API would 400 (e.g. content as a number, malformed blocks) still
-// gets a response here. Schema validation is the planned Phase 2 strict
-// mode, not this function's job.
+// gets a response here. Schema validation is strict mode's job
+// (strict.go), not this function's.
 func (m chatMessage) contentChars() int {
 	if len(m.Content) == 0 {
 		return 0

@@ -8,6 +8,10 @@
 # "the drift tests did not execute". MOCKLM_VALIDATE_RESPONSES=1 turns on the
 # response self-validation closed loop for every test request.
 #
+# The suite runs under -race: the concurrent scenario-replacement and
+# per-scenario counter tests are only meaningful with the race detector on,
+# so the race gate is enforced here, not promised in a comment.
+#
 # To check for live drift against a nanollm checkout, run locally with
 # NANOLLM_SPEC_DIR=../nanollm/spec (see scripts/refresh-specs.sh).
 name: ci
@@ -27,8 +31,8 @@ jobs:
         run: go build ./...
       - name: go vet
         run: go vet ./...
-      - name: go test (spec-sync gate + response self-validation on)
+      - name: go test -race (spec-sync gate + response self-validation on)
         env:
           MOCKLM_REQUIRE_SPEC_SYNC: "1"
           MOCKLM_VALIDATE_RESPONSES: "1"
-        run: go test ./...
+        run: go test -race ./...

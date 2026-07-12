@@ -11,7 +11,7 @@ import (
 	"unicode/utf8"
 )
 
-// --- Phase 3a: scenario registry — chunkExact losslessness, exact-content
+// --- Scenario registry — chunkExact losslessness, exact-content
 // emit paths, per-scenario raw capture + counters, provider/surface
 // binding, register-time rejection ---
 
@@ -584,8 +584,11 @@ func TestScenarioFaultsAndHeaderOverlay(t *testing.T) {
 	srv := testServer(defaultConfig())
 	defer srv.Close()
 
-	// attempt_faults on the scenario config index the PROVIDER-GLOBAL
-	// counter (K1/R6): attempt 0 on openai fails, attempt 1 succeeds.
+	// attempt_faults on the scenario config index the SCENARIO's own
+	// fault-attempt counter: attempt 0 fails, attempt 1 succeeds —
+	// regardless of any other traffic on the provider (see
+	// TestScenarioAttemptIsolationUnderParallelLoad for the isolation
+	// guarantees).
 	body, _ := json.Marshal(map[string]any{
 		"id": "flt", "provider": "openai", "model": "gpt-flt",
 		"output": map[string]any{"text": "ok"},
@@ -679,7 +682,7 @@ func TestScenarioStoreConcurrentReplaceWhileServing(t *testing.T) {
 	<-done
 }
 
-// --- fault catalog + fault presets admin surface (Phase 3d/4.4) ---
+// --- fault catalog + fault presets admin surface ---
 
 func TestAdminFaultCatalogAndPresets(t *testing.T) {
 	srv := testServer(defaultConfig())
@@ -693,7 +696,7 @@ func TestAdminFaultCatalogAndPresets(t *testing.T) {
 	for _, e := range catalog.Faults {
 		byMode[e.Mode] = e
 	}
-	for _, mode := range []string{"error", "non_json_body", "disconnect", "stall", "malformed_chunk", "unknown_event", "unknown_block", "stream_error"} {
+	for _, mode := range []string{"error", "non_json_body", "delay", "disconnect", "stall", "malformed_chunk", "unknown_event", "unknown_block", "stream_error"} {
 		if _, ok := byMode[mode]; !ok {
 			t.Fatalf("catalog is missing mode %q", mode)
 		}
@@ -713,14 +716,14 @@ func TestAdminFaultCatalogAndPresets(t *testing.T) {
 	for _, p := range presets.FaultPresets {
 		names[p.Name] = true
 	}
-	for _, want := range []string{"retry-storm", "decoder-probe", "usage-omit", "transport-crlf-coalesce", "mid-stream-cut"} {
+	for _, want := range []string{"retry-storm", "decoder-probe", "usage-omit", "transport-crlf-coalesce", "mid-stream-cut", "slow-first-attempt"} {
 		if !names[want] {
 			t.Fatalf("fault presets missing %q (got %v)", want, names)
 		}
 	}
 }
 
-// --- /v1/responses stream in the fault loop (Phase 3d/4.2a) ---
+// --- /v1/responses stream in the fault loop ---
 
 func TestResponsesStreamFaultInjection(t *testing.T) {
 	// A stream-phase disconnect spec must now fire on the Responses stream

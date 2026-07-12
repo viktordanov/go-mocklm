@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// --- Phase 2b: usage faults (D1-D3), deterministic transport faults
+// --- Usage faults (D1-D3), deterministic transport faults
 // (A2 fragmentation / A3 CRLF+coalesce / A7 stall), and the HTTP fault
 // trio (C2 Retry-After date / C5 via error mode / C9 non-JSON 200) ---
 

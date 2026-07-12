@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 )
@@ -16,13 +15,38 @@ func main() {
 	state := NewServerState(cfg)
 	mux := buildMux(state)
 
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	log.Printf("mocklm starting on %s", addr)
+	// Dual-listener startup: the clear-text lane and the TLS/h2 observation
+	// lane run side by side, each independently enable/disable-able via
+	// MOCKLM_HTTP_*/MOCKLM_TLS_* env vars (see tls.go).
+	spec, err := resolveListenerSpec(&cfg.Server)
+	if err != nil {
+		log.Fatalf("Listener config error: %v", err)
+	}
 	log.Printf("Config:\n%s", cfg.summary())
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("Server error: %v", err)
+	errCh := make(chan error, 2)
+	if spec.httpEnabled {
+		log.Printf("mocklm HTTP listening on %s", spec.httpAddr)
+		go func() {
+			errCh <- http.ListenAndServe(spec.httpAddr, mux)
+		}()
 	}
+	if spec.tlsEnabled {
+		cert, err := loadOrGenerateCert(spec.certFile, spec.keyFile)
+		if err != nil {
+			log.Fatalf("TLS setup error: %v", err)
+		}
+		certSource := "in-memory self-signed"
+		if spec.certFile != "" {
+			certSource = spec.certFile
+		}
+		log.Printf("mocklm HTTPS (h2 via ALPN) listening on %s (cert: %s)", spec.tlsAddr, certSource)
+		srv := newTLSServer(spec.tlsAddr, mux, cert)
+		go func() {
+			errCh <- srv.ListenAndServeTLS("", "")
+		}()
+	}
+	log.Fatalf("Server error: %v", <-errCh)
 }
 
 // buildMux wires all routes including admin endpoints.
@@ -62,7 +86,7 @@ func buildMux(state *ServerState) *http.ServeMux {
 	mux.HandleFunc("GET /admin/faults", handleAdminGetFaults())
 	mux.HandleFunc("GET /admin/fault-presets", handleAdminGetFaultPresets())
 
-	// Scenario registry (Phase 3a). Scenarios survive POST /admin/reset;
+	// Scenario registry. Scenarios survive POST /admin/reset;
 	// DELETE /admin/scenarios is their lifecycle boundary.
 	mux.HandleFunc("POST /admin/scenarios", handleAdminPostScenario(state))
 	mux.HandleFunc("GET /admin/scenarios", handleAdminGetScenarios(state))
@@ -72,6 +96,8 @@ func buildMux(state *ServerState) *http.ServeMux {
 	mux.HandleFunc("GET /admin/scenarios/{id}/last-request", handleAdminScenarioLastRequest(state))
 	mux.HandleFunc("GET /admin/scenarios/{id}/request-count", handleAdminScenarioRequestCount(state))
 	mux.HandleFunc("POST /admin/scenarios/{id}/request-count/reset", handleAdminScenarioResetRequestCount(state))
+	mux.HandleFunc("GET /admin/scenarios/{id}/attempt-count", handleAdminScenarioAttemptCount(state))
+	mux.HandleFunc("POST /admin/scenarios/{id}/attempt-count/reset", handleAdminScenarioResetAttemptCount(state))
 
 	return mux
 }

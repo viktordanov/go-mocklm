@@ -119,8 +119,10 @@ func handleAdminClearRequests(state *ServerState) http.HandlerFunc {
 // handleAdminGetRequestCount returns the per-provider request counts since
 // the last reset/config update — the attempt-counter oracle: a test can
 // assert exactly how many attempts the proxy made (retries, fallbacks)
-// without parsing recorded bodies. The same counter indexes fail_first_n
-// and attempt_faults.
+// without parsing recorded bodies. Scenario-matched traffic counts here
+// too; the counter also indexes fail_first_n and attempt_faults for
+// provider- and header-level configs (matched scenarios index their own
+// counter at /admin/scenarios/{id}/attempt-count).
 func handleAdminGetRequestCount(state *ServerState) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		openai, anthropic, bedrock := state.AttemptCounts()

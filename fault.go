@@ -61,6 +61,17 @@ type FaultSpec struct {
 	//                     after the first frame when no WHEN is set).
 	//   "non_json_body"   C9: a 200 with a text/html body instead of JSON —
 	//                     the classic proxy error page. Pre-body only.
+	//   "delay"           NON-TERMINAL pre-body wait: hold delay_ms
+	//                     (cancelably), then CONTINUE normal handling —
+	//                     unlike every other mode, the request still gets
+	//                     its normal response. Composes with attempt_faults
+	//                     for per-attempt timing sequences (slow first
+	//                     attempt, instant retry). delay_ms must be > 0;
+	//                     the WHEN knobs (after_event/after_n/after_bytes/
+	//                     after_ms) are rejected so after_ms can't be
+	//                     confused with the duration. Distinct from "stall"
+	//                     (mid-stream, holds until client disconnect) and
+	//                     from timeout_ms (holds then closes).
 	//
 	// The decoder-fault modes (unknown_event / unknown_block /
 	// stream_error) emit WELL-FORMED but off-union payloads: the pinned
@@ -82,6 +93,9 @@ type FaultSpec struct {
 	// Repeat emits the injected frame/block this many times (default 1) —
 	// the same type twice in one stream is the decoder's warn-once probe.
 	Repeat int `toml:"repeat" json:"repeat,omitempty"`
+	// DelayMs is the "delay" mode's duration — how long the non-terminal
+	// pre-body wait holds before normal handling continues. Must be > 0.
+	DelayMs int `toml:"delay_ms" json:"delay_ms,omitempty"`
 }
 
 // streamPhase reports whether the spec fires during the SSE stream (vs
@@ -102,6 +116,13 @@ func validateFaultSpec(f *FaultSpec) error {
 	case "error", "non_json_body":
 		if f.AfterEvent != "" || f.AfterN > 0 || f.AfterBytes > 0 {
 			return fmt.Errorf("fault mode %q cannot fire mid-stream (the status is locked once the body starts); use \"stream_error\" or \"disconnect\"", f.Mode)
+		}
+	case "delay":
+		if f.DelayMs <= 0 {
+			return fmt.Errorf("fault mode \"delay\" requires delay_ms > 0")
+		}
+		if f.AfterEvent != "" || f.AfterN > 0 || f.AfterBytes > 0 || f.AfterMs > 0 {
+			return fmt.Errorf("fault mode \"delay\" is pre-body and non-terminal: the WHEN knobs (after_event/after_n/after_bytes/after_ms) are not allowed — delay_ms alone is the duration")
 		}
 	case "disconnect", "malformed_chunk", "unknown_event", "unknown_block", "stream_error", "stall":
 	default:
@@ -281,13 +302,20 @@ func checkFaults(w http.ResponseWriter, r *http.Request, cfg *ProviderConfig, li
 		return true
 	}
 
-	// 0b. Attempt accounting: every request that reaches fault processing
-	// counts, so retries the proxy makes are observable at
+	// 0b. Attempt accounting, two independent meanings: the PROVIDER
+	// counter counts every request that reaches fault processing — scenario
+	// traffic included — so retries the proxy makes are observable at
 	// /admin/request-count even when they end up rate-limited or failed.
-	// fail_first_n and attempt_faults index off the same counter.
+	// The FAULT attempt drives fail_first_n / attempt_faults indexing: it
+	// defaults to the provider attempt, but a matched scenario supplies its
+	// own counter (applyScenario) so unrelated traffic on the provider
+	// cannot shift that scenario's fault sequence.
 	var attempt int64 = 1
 	if state != nil {
 		attempt = state.NextAttempt(provider)
+	}
+	if cfg.faultAttemptCounter != nil {
+		attempt = cfg.faultAttemptCounter.Add(1)
 	}
 
 	// 0c. Resolve this request's fault specs: global faults plus this
@@ -340,11 +368,20 @@ func checkFaults(w http.ResponseWriter, r *http.Request, cfg *ProviderConfig, li
 		return true
 	}
 
-	// 2c. Pre-body fault specs ("error" and un-WHEN'd "disconnect"): the
-	// first one wins — the request is over once it fires. after_ms holds
-	// cancel-aware before firing.
-	if len(preBody) > 0 {
-		f := &preBody[0]
+	// 2c. Pre-body fault specs, walked in declaration order. "delay" is
+	// NON-TERMINAL: it holds delay_ms cancelably and lets handling
+	// continue (multiple delays compose additively). The first TERMINAL
+	// spec ("error", "non_json_body", un-WHEN'd "disconnect") fires and
+	// the request is over — first-terminal-fault-wins, as before. after_ms
+	// holds cancel-aware before a terminal spec fires.
+	for i := range preBody {
+		f := &preBody[i]
+		if f.Mode == "delay" {
+			if !waitCancelable(ctx, f.DelayMs) {
+				return true // client gone during the delay; handler freed
+			}
+			continue
+		}
 		if !waitCancelable(ctx, f.AfterMs) {
 			return true // client gone; nothing left to serve
 		}
@@ -756,6 +793,12 @@ func faultCatalog() []FaultCatalogEntry {
 			WhenKnobs:   []string{"after_ms"},
 		},
 		{
+			Mode:        "delay",
+			Phase:       "pre-body",
+			Description: "NON-TERMINAL: hold delay_ms (cancelably), then continue normal handling — per-attempt timing via attempt_faults (slow first attempt, instant retry). Distinct from stall (mid-stream, holds until client disconnect), timeout_ms (holds then closes), latency_ms/slow_header_ms (config-level delays on every request). No WHEN knobs: delay_ms alone is the duration",
+			Params:      []string{"delay_ms"},
+		},
+		{
 			Mode:        "disconnect",
 			Phase:       "pre-body-or-stream",
 			Description: "TCP RST; pre-body when no stream WHEN knob is set, otherwise mid-stream after the WHEN matches",
@@ -854,6 +897,16 @@ func builtinFaultPresets() map[string]FaultPreset {
 			Name:        "mid-stream-cut",
 			Description: "TCP RST after the third stream frame — the abrupt mid-stream provider death",
 			Config:      ProviderConfig{Faults: []FaultSpec{{Mode: "disconnect", AfterN: 3}}},
+		},
+		"slow-first-attempt": {
+			Name:        "slow-first-attempt",
+			Description: "Attempt 0 waits 5s before responding NORMALLY (non-terminal delay), attempt 1 is instant — hang-detection/retry-timing sequences; register into a scenario for a per-scenario deterministic sequence under parallel load",
+			Config: ProviderConfig{
+				AttemptFaults: [][]FaultSpec{
+					{{Mode: "delay", DelayMs: 5000}},
+					{},
+				},
+			},
 		},
 	}
 }

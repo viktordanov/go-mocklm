@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// --- Phase 1: Anthropic stream event-ordering contract ---
+// --- Anthropic stream event-ordering contract ---
 //
 // Schema validation proves each SSE payload is a well-formed
 // MessageStreamEvent, but it cannot see the protocol between frames:

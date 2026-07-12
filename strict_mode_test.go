@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// --- Phase 2: strict mode (contract oracle) + spec-anchored fixtures ---
+// --- Strict mode (contract oracle) + spec-anchored fixtures ---
 
 func strictConfig() *Config {
 	cfg := defaultConfig()

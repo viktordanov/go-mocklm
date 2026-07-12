@@ -47,6 +47,7 @@ func handleOpenAICompletions(state *ServerState) http.HandlerFunc {
 			Provider:  "openai",
 			Method:    r.Method,
 			Path:      r.URL.Path,
+			Proto:     r.Proto,
 			Headers:   headers,
 			Body:      json.RawMessage(rawBody),
 		})
@@ -61,6 +62,9 @@ func handleOpenAICompletions(state *ServerState) http.HandlerFunc {
 			return
 		}
 
+		if rejectLeakedCacheControl(w, &cfg, "openai", rawBody) {
+			return
+		}
 		if checkFaults(w, r, &cfg, limiter, state, "openai") {
 			return
 		}
@@ -123,8 +127,35 @@ func handleCompletionsNonStream(w http.ResponseWriter, _ *ProviderConfig, id, mo
 	json.NewEncoder(w).Encode(resp)
 }
 
+// handleCompletionsStream runs the legacy completions stream through the
+// SAME fault pipeline as the other stream surfaces: the SSE transport faults
+// (crlf/fragment/coalesce), the resolved cfg.streamFaults injector, and the
+// legacy checkStreamingFault knobs (disconnect_after_chunks /
+// malformed_chunk). The stream is exactly two real data frames — content,
+// then finish — followed by [DONE]. after_n counts REAL frames and fires
+// AFTER the Nth: after_n=1 lets the content frame out and cuts before the
+// finish frame; after_n=2 lets the finish frame out and cuts before [DONE].
 func handleCompletionsStream(ctx context.Context, w http.ResponseWriter, cfg *ProviderConfig, id, model string, words []string, outputTokens int) {
 	sse := newSSEWriter(w)
+	sse.applyTransportFaults(ctx, cfg)
+
+	// Legacy completions bodies are outside the vendored validation closure
+	// (see ValidateResponses), so frames go out unvalidated by design.
+	writeFrame := func(_, data string) bool {
+		sse.writeData(data)
+		return false
+	}
+	inj := newStreamFaultInjector(ctx, cfg.streamFaults, w, sse, writeFrame)
+
+	// emit writes one real frame, then gives the fault injector its shot.
+	// Returns false when the stream must abort.
+	emit := func(payload map[string]any) bool {
+		data, _ := json.Marshal(payload)
+		if writeFrame("", string(data)) {
+			return false
+		}
+		return !inj.afterFrame("")
+	}
 
 	if cfg.TtftMs > 0 {
 		if !sleepWithPings(ctx, sse, cfg.TtftMs, cfg.SseKeepaliveIntervalMs) {
@@ -132,33 +163,40 @@ func handleCompletionsStream(ctx context.Context, w http.ResponseWriter, cfg *Pr
 		}
 	}
 
-	// Content chunk (single chunk keeps the legacy emulation simple)
-	chunk, _ := json.Marshal(map[string]any{
-		"id":      id,
-		"object":  "text_completion",
-		"created": time.Now().Unix(),
-		"model":   model,
-		"choices": []map[string]any{
-			{"text": joinContent(words), "index": 0, "logprobs": nil, "finish_reason": nil},
+	// Content chunk (single chunk keeps the legacy emulation simple), then
+	// the finish chunk with usage.
+	frames := []map[string]any{
+		{
+			"id":      id,
+			"object":  "text_completion",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{
+				{"text": joinContent(words), "index": 0, "logprobs": nil, "finish_reason": nil},
+			},
 		},
-	})
-	sse.writeData(string(chunk))
-
-	// Finish chunk with usage
-	finish, _ := json.Marshal(map[string]any{
-		"id":      id,
-		"object":  "text_completion",
-		"created": time.Now().Unix(),
-		"model":   model,
-		"choices": []map[string]any{
-			{"text": "", "index": 0, "logprobs": nil, "finish_reason": "stop"},
+		{
+			"id":      id,
+			"object":  "text_completion",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{
+				{"text": "", "index": 0, "logprobs": nil, "finish_reason": "stop"},
+			},
+			"usage": map[string]any{
+				"prompt_tokens":     1,
+				"completion_tokens": outputTokens,
+				"total_tokens":      1 + outputTokens,
+			},
 		},
-		"usage": map[string]any{
-			"prompt_tokens":     1,
-			"completion_tokens": outputTokens,
-			"total_tokens":      1 + outputTokens,
-		},
-	})
-	sse.writeData(string(finish))
-	sse.writeData("[DONE]")
+	}
+	for i, frame := range frames {
+		if checkStreamingFault(w, cfg, i, len(frames)) {
+			return
+		}
+		if !emit(frame) {
+			return
+		}
+	}
+	sse.writeDone()
 }

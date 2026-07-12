@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	"github.com/BurntSushi/toml"
 )
@@ -50,9 +51,25 @@ type ProviderConfig struct {
 	// OpenAI prompt_tokens_details.cached_tokens.
 	CacheReadTokens     int `toml:"cache_read_tokens" json:"cache_read_tokens"`
 	CacheCreationTokens int `toml:"cache_creation_tokens" json:"cache_creation_tokens"`
-	// FailFirstN deterministically fails the first N requests seen by the
-	// provider (with error_status), then succeeds. The counter resets on
-	// config update/reset. Deterministic alternative to error_rate.
+	// RejectCacheControl turns the mock into an inbound-leak oracle: any
+	// JSON object in the request body carrying a cache_control member that
+	// itself contains a "type" member (the wire shape of a real
+	// cache_control block) is rejected with a provider-shaped 400 naming
+	// the leak's JSON path — an assertion that the gateway under test
+	// strips cache_control before forwarding. Checked on every
+	// body-bearing surface AFTER valid-JSON parse (malformed input keeps
+	// the normal invalid-JSON error) and BEFORE fault processing, so a
+	// configured fault can never mask the assertion. Honored from provider
+	// and scenario configs (not the X-MockLM-Fault header, which overlays
+	// inside fault processing). Default off. cache_control members WITHOUT
+	// a "type" member are accepted — the oracle matches the consumer
+	// contract, not the key name alone.
+	RejectCacheControl bool `toml:"reject_cache_control" json:"reject_cache_control"`
+	// FailFirstN deterministically fails the first N requests of the
+	// fault-attempt sequence (with error_status), then succeeds — the
+	// provider counter for provider/header configs (reset on config
+	// update/reset), the scenario's own counter for a matched scenario
+	// (see faultAttemptCounter). Deterministic alternative to error_rate.
 	FailFirstN int `toml:"fail_first_n" json:"fail_first_n"`
 	// DisconnectAfterEvent cuts the Anthropic stream (TCP RST) immediately
 	// after writing the named SSE event type, e.g. "message_delta" leaves
@@ -143,12 +160,16 @@ type ProviderConfig struct {
 	// stream modes fire as the SSE stream progresses.
 	Faults []FaultSpec `toml:"faults" json:"faults,omitempty"`
 	// AttemptFaults[i] is the fault list applied only to the i-th request
-	// (0-based) seen by the provider since the last config update/reset —
-	// the request counter shared with fail_first_n and exposed at
-	// /admin/request-count. Requests past the end of the array get no
-	// attempt faults. Generalizes fail_first_n: attempt_faults =
-	// [[{"mode":"error"}], []] fails attempt 0 and lets attempt 1 succeed —
-	// the canonical retry/fallback scenario without header targeting.
+	// (0-based) of the fault-attempt sequence. For provider- and header-
+	// level configs that sequence is the provider counter (reset on config
+	// update/reset, exposed at /admin/request-count); for a matched
+	// scenario's config it is that SCENARIO's own counter (exposed at
+	// /admin/scenarios/{id}/attempt-count), so unrelated traffic on the
+	// same provider cannot shift the sequence. Requests past the end of
+	// the array get no attempt faults. Generalizes fail_first_n:
+	// attempt_faults = [[{"mode":"error"}], []] fails attempt 0 and lets
+	// attempt 1 succeed — the canonical retry/fallback scenario without
+	// header targeting.
 	AttemptFaults [][]FaultSpec `toml:"attempt_faults" json:"attempt_faults,omitempty"`
 
 	// streamFaults holds this request's resolved stream-phase fault specs
@@ -157,6 +178,16 @@ type ProviderConfig struct {
 	// injector without re-consuming the attempt counter. Unexported: never
 	// serialized.
 	streamFaults []FaultSpec
+
+	// faultAttemptCounter, when non-nil, scopes the fault-attempt sequence
+	// (fail_first_n / attempt_faults indexing) to a matched scenario: set
+	// by applyScenario to the scenario's own atomic, nil on provider- and
+	// header-level configs, which keep indexing the provider counter.
+	// Unexported: never serialized, and it survives the X-MockLM-Fault
+	// JSON overlay because unexported fields are not unmarshaled. The
+	// provider counter still counts scenario traffic either way —
+	// /admin/request-count semantics are unchanged.
+	faultAttemptCounter *atomic.Int64
 }
 
 type Config struct {

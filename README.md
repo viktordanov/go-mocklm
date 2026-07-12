@@ -123,6 +123,31 @@ reasoning_tokens = 0
 thinking_delay_ms = 0
 ```
 
+### Listeners: HTTPS + h2/ALPN observation lane
+
+The mock can run a **TLS listener alongside the clear-text one**, so a
+gateway harness can assert transport behavior a plain-HTTP mock cannot
+observe: Go's `net/http` negotiates HTTP/2 over TLS via ALPN automatically,
+and every recorded request carries `proto` (`"HTTP/2.0"` vs `"HTTP/1.1"`) in
+`GET /admin/requests`; scenario captures report the same value via the
+`X-MockLM-Captured-Protocol` header. Whether the client under test actually
+spoke h2 is then a recorded-request assertion.
+
+Everything is env-var configurable; defaults preserve the historical single
+clear-text listener:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MOCKLM_HTTP_ENABLED` | on | Clear-text lane (`"0"`/`"false"` disables) |
+| `MOCKLM_HTTP_PORT` | `[server].port` | Clear-text port |
+| `MOCKLM_TLS_ENABLED` | off | TLS/h2 lane |
+| `MOCKLM_TLS_PORT` | `9443` | TLS port |
+| `MOCKLM_TLS_CERT` / `MOCKLM_TLS_KEY` | unset | PEM pair override — both-or-neither; when absent an **in-memory self-signed** ECDSA cert (localhost / 127.0.0.1 / ::1) is generated at startup, so clients skip verification or pin the presented cert |
+
+At least one lane must be enabled; both lanes serve the identical mux
+(providers + admin). To pin a client to HTTP/1.1 over TLS (the negative arm
+of an ALPN assertion), give its transport a non-nil empty `TLSNextProto`.
+
 ### Provider Config Fields
 
 | Field | Type | Default | Description |
@@ -147,16 +172,17 @@ thinking_delay_ms = 0
 | `sse_keepalive_interval_ms` | int | 0 | Emit `: ping` SSE comments at this interval during TTFT waits (0 = disabled) |
 | `stop_reason` | string | "" | Override the emitted stop reason. Anthropic: `stop_reason` (e.g. `pause_turn`, `refusal`). OpenAI: `finish_reason` (e.g. `content_filter`). Empty = default |
 | `strict` | bool | false | Anthropic request-shape checker (bounded): request-side, Anthropic-only, manual field allowlist — not a general request-schema validator. Rejects requests the real API would 400 — unknown top-level fields, missing `model`/`messages`/`max_tokens`, `temperature` outside [0,1], OpenAI tool wrappers / string `tool_choice` / OpenAI roles / `image_url` blocks, and missing required fields on common content blocks. Bounded depth (see `strict.go`); field sets mirror `CreateMessageParams` in Anthropic's OpenAPI spec |
+| `reject_cache_control` | bool | false | Inbound-leak **oracle**: reject (provider-shaped 400) any request whose JSON body contains an object with a `cache_control` member that itself has a `type` member — an assertion that the gateway under test strips `cache_control` before forwarding. The diagnostic names the leak's JSON path (`messages[0].content[1].cache_control`; deterministic — lexicographic key order). Checked on every body-bearing surface after valid-JSON parse and **before fault processing** (a configured fault can't mask the assertion). Honored from provider and scenario configs; `cache_control` members without `type` are accepted |
 | `cache_read_tokens` | int | 0 | Prompt-cache reads: Anthropic `usage.cache_read_input_tokens`, OpenAI `usage.prompt_tokens_details.cached_tokens` |
 | `cache_creation_tokens` | int | 0 | Anthropic: add `usage.cache_creation_input_tokens` to responses (0 = omitted) |
-| `fail_first_n` | int | 0 | Deterministically fail the first N requests (per provider) with `error_status`, then succeed. Counter resets on config update/reset. Deterministic alternative to `error_rate` |
+| `fail_first_n` | int | 0 | Deterministically fail the first N requests of the fault-attempt sequence with `error_status`, then succeed (provider counter for provider/header configs — resets on config update/reset; the scenario's own counter for a matched scenario). Deterministic alternative to `error_rate` |
 | `disconnect_after_event` | string | "" | Anthropic streaming: TCP RST immediately after the named SSE event type is written (e.g. `message_delta` leaves a stop_reason but no `message_stop`; `content_block_start` cuts before any delta) |
 | `emit_nonstandard_fields` | bool | false | Inject genuinely-unknown probe fields (`x_mock_unknown_field` on Anthropic message shapes / `message_delta.delta`, `x_mock_unknown_usage_field` on usage) as an unknown-field-tolerance fault. Spec-required nullable fields (`stop_details`, `usage.inference_geo`, `usage.output_tokens_details`) are always emitted regardless — they are in the pinned spec's `Message.required`/`Usage.required` |
 | `suppress_ping_events` | bool | false | Anthropic streaming: omit the typed `ping` event after `message_start`. The real API sends it, but the pinned spec's `MessageStreamEvent` union has no ping arm — the built-in validator handles it via a local ping arm, so this knob is only needed for external strict-validation harnesses |
 | `legacy_stream_usage` | bool | false | OpenAI streaming: restore the old mock usage shape (usage rides the finish chunk unconditionally, `stream_options.include_usage` ignored). Default emits the real API shape |
 | `validate_responses` | bool? | unset | Self-validation of the surfaces covered by the vendored closure of nanollm's pinned specs: OpenAI chat-completion and Anthropic messages bodies (non-stream + each SSE `data:` payload) and provider error envelopes on every endpoint, checked before writing (see [Spec-Sync & Response Validation](#spec-sync--response-validation) — `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/models` success bodies are outside the closure and not validated). Tri-state: unset defers to the `MOCKLM_VALIDATE_RESPONSES` env default; explicit `false` (e.g. via `X-MockLM-Fault`) opts a deliberate-fault request out |
 | `faults` | []FaultSpec | [] | Generalized two-knob fault list (WHEN × HOW) applied to every request; composes with all knobs above. See [Two-Knob Fault Specs](#two-knob-fault-specs-when--how) |
-| `attempt_faults` | [][]FaultSpec | [] | Per-attempt fault arrays: entry `i` applies only to the i-th request (0-based) seen by the provider since the last config update/reset; requests past the end get none. Generalizes `fail_first_n` — `[[{"mode":"error"}], []]` fails attempt 0 and lets attempt 1 succeed, the canonical retry/fallback scenario without header targeting |
+| `attempt_faults` | [][]FaultSpec | [] | Per-attempt fault arrays: entry `i` applies only to the i-th request (0-based) of the fault-attempt sequence — the provider counter for provider/header configs, the scenario's own counter for a matched scenario; requests past the end get none. Generalizes `fail_first_n` — `[[{"mode":"error"}], []]` fails attempt 0 and lets attempt 1 succeed, the canonical retry/fallback scenario without header targeting |
 
 ## Request Fidelity
 
@@ -215,7 +241,7 @@ Checked before any content is generated:
 | 1 | Rate limit | `rate_limit_rpm > 0` | 429 + `Retry-After` header + provider-format error JSON |
 | 2 | Deterministic error | `fail_first_n > 0` (first N requests per provider) | Returns `error_status` with provider-format error JSON |
 | 3 | Random error | `error_rate > 0` (random roll) | Returns `error_status` with provider-format error JSON |
-| 4 | Pre-body fault specs | `faults` / `attempt_faults` entries with mode `error`, or `disconnect` without a stream WHEN | Provider-format error (`error_status`/`error_type`/`error_message`) or RST, after an optional cancel-aware `after_ms` hold |
+| 4 | Pre-body fault specs | `faults` / `attempt_faults` entries with mode `error`, `non_json_body`, `delay`, or `disconnect` without a stream WHEN | Walked in declaration order: `delay` waits `delay_ms` cancelably then **continues** (non-terminal; multiple delays compose additively); the first terminal spec fires — provider-format error or RST — after an optional cancel-aware `after_ms` hold — and ends the request |
 | 5 | Timeout | `timeout_ms > 0` | Sleeps (cancel-aware), then hijacks the TCP socket and sends RST |
 | 6 | Latency | `latency_ms > 0` | Sleeps (cancel-aware) before proceeding to generate the response |
 
@@ -240,6 +266,7 @@ written), `after_event` (fires right after the named Anthropic SSE event),
 | `stream_error` | stream (Anthropic) | **B5**: mid-stream `event: error` with `error_type`/`error_message` (default `overloaded_error`); the stream continues — compose `{"mode":"disconnect","after_event":"error"}` to cut after it |
 | `stall` | stream | **A7**: stop writing mid-stream and hold the connection open — no bytes, no close — until the client disconnects. Fires after the first frame when no WHEN is set |
 | `non_json_body` | pre-body | **C9**: a 200 with a `text/html` error-page body instead of JSON (the classic intermediary-proxy failure). Pre-body only; stream WHENs are rejected with 400 |
+| `delay` | pre-body | **NON-TERMINAL**: hold `delay_ms` (cancelably — a client timeout frees the handler), then continue normal handling. Via `attempt_faults` this gives deterministic per-attempt timing sequences: `[[{"mode":"delay","delay_ms":5000}], []]` = first attempt waits 5s, second is instant — per-scenario under parallel load (see the scenario attempt counter). `delay_ms` must be > 0; all WHEN knobs (incl. `after_ms`) are rejected with 400 so `after_ms` can't be confused with the duration. Distinct from `stall` (mid-stream, holds until client disconnect) and `timeout_ms` (holds then closes). Preset: `slow-first-attempt` |
 
 `error`-mode specs additionally accept `retry_after`, set verbatim on the
 `Retry-After` header — numeric seconds or an HTTP-date (**C2**: the date
@@ -267,8 +294,13 @@ spec-required and not covered.
 ### Deterministic SSE Transport Faults (A2/A3)
 
 Provider knobs that alter how SSE frames hit the wire without changing
-their payloads (the re-framing/robustness probes; applied on the chat and
-messages streams):
+their payloads (the re-framing/robustness probes). They apply on all
+**four SSE stream surfaces** — chat, messages, responses, and legacy
+completions — which share the same `sseWriter` transport path. Bedrock
+ConverseStream is NOT one of them: AWS eventstream has its own binary
+framing, so these knobs do not apply there (Bedrock rides the stream-fault
+*injector* with eventstream dialects instead — see
+[Bedrock Converse / ConverseStream](#bedrock-converse--conversestream)):
 
 | Knob | Fault |
 |---|---|
@@ -295,7 +327,9 @@ curl -s http://localhost:9999/admin/config -X PUT -d '{"anthropic":{
 
 `GET /admin/request-count` returns `{"openai": N, "anthropic": M, "bedrock": K}`
 — the per-provider request counts since the last reset/config update (the
-same counter that indexes `fail_first_n` and `attempt_faults`). The
+counter that indexes `fail_first_n` and `attempt_faults` for provider- and
+header-level configs; matched scenarios index their own counter at
+`/admin/scenarios/{id}/attempt-count`). The
 `bedrock` key is additive to the historical two-key shape: consumers
 ignoring unknown keys are unaffected; an exact-key-set assertion must be
 relaxed. Every request that reaches fault processing counts, including ones
@@ -310,7 +344,8 @@ mode, its phase (pre-body / stream), WHEN knobs, params, whether it requires
 `validate_responses: false` (the decoder-fault modes do), and its Bedrock
 dialect where it differs. `GET /admin/fault-presets` lists named fault
 bundles (`retry-storm`, `decoder-probe`, `usage-omit`,
-`transport-crlf-coalesce`, `mid-stream-cut`) — ProviderConfig fragments
+`transport-crlf-coalesce`, `mid-stream-cut`, `slow-first-attempt`) —
+ProviderConfig fragments
 registerable straight into a scenario via
 `POST /admin/scenarios {"fault_preset": "name", ...}` (the scenario's own
 `config` overlays the preset).
@@ -423,14 +458,19 @@ Scenario surfaces in v1: `/v1/chat/completions`, `/v1/messages`, Bedrock
 `converse`/`converse-stream`. A targeting header on `/v1/responses`,
 `/v1/completions`, or `/v1/embeddings` is a **loud 400**, not a silent no-op.
 
-**What a scenario CANNOT scope (v1, deliberate):** `rate_limit_rpm`,
-`max_concurrent`, and the attempt counter driving `fail_first_n` /
-`attempt_faults` are **provider-global**. Registering a scenario config that
-sets `rate_limit_rpm`/`max_concurrent` is **rejected with 400** rather than
-silently ignored. Consequences: scenarios on one provider share its
-concurrency gate, RPM limiter, and attempt sequence — per-scenario
-`attempt_faults` are not independent across scenarios on the same provider,
-and the counter is advanced by *all* traffic on that provider.
+**What a scenario scopes:** content + faults + capture + its **own
+fault-attempt sequence**. A matched scenario's `fail_first_n` /
+`attempt_faults` index the scenario's own counter (exposed at
+`GET /admin/scenarios/{id}/attempt-count`), so two scenarios on one
+provider — and any non-scenario background traffic — have fully independent
+fault sequences under parallel load. Same-scenario concurrent requests are
+ordered by the atomic increment: which caller draws attempt 1 is
+scheduler-dependent.
+
+**What a scenario CANNOT scope (deliberate):** `rate_limit_rpm` and
+`max_concurrent` are **provider-global**. Registering a scenario config that
+sets them is **rejected with 400** rather than silently ignored: scenarios
+on one provider share its concurrency gate and RPM limiter.
 
 **Routes:**
 
@@ -443,6 +483,8 @@ DELETE /admin/scenarios                    clear all
 GET    /admin/scenarios/{id}/last-request  raw bytes of the last matched request body
 GET    /admin/scenarios/{id}/request-count {"count": N}  (matched-raw-requests)
 POST   /admin/scenarios/{id}/request-count/reset
+GET    /admin/scenarios/{id}/attempt-count {"count": N}  (fault-attempt sequence)
+POST   /admin/scenarios/{id}/attempt-count/reset         (re-arms fail_first_n/attempt_faults)
 ```
 
 Registering a second scenario for an already-claimed `(provider, model)` is a
@@ -452,16 +494,26 @@ test); re-POSTing the same id replaces (and resets its capture state).
 **Capture is body-exact, not wire-exact.** `last-request` writes the captured
 body bytes **directly** (no re-marshal) — a byte-diff against what the client
 sent is exact. Method/path/protocol/timestamp ride `X-MockLM-Captured-*`
-response headers. Repeated header values, header ordering, the query string,
-and TLS/ALPN are *not* captured (`Protocol` is inert on the cleartext server).
+response headers. Repeated header values, header ordering, and the query
+string are *not* captured. `X-MockLM-Captured-Protocol` reports the
+negotiated protocol — `HTTP/2.0` vs `HTTP/1.1` on the [TLS lane](#listeners-https--h2alpn-observation-lane),
+always `HTTP/1.1` on the clear-text lane.
 `request-count` counts **matched raw requests** (capture happens at match
-time, before fault processing) and is a different number from the
-provider-global attempt counter at `/admin/request-count`.
+time, before fault processing); `attempt-count` counts matched requests
+that **reached fault processing** — the number the scenario's
+`fail_first_n`/`attempt_faults` index, and the retry-test oracle. The two
+can differ (e.g. a malformed `X-MockLM-Fault` header is captured but
+rejected before attempt accounting). Both are distinct from the
+provider-wide counter at `/admin/request-count`, which counts ALL traffic.
 
 **Lifecycle:** scenarios are test fixtures with independent lifetimes —
-`POST /admin/reset` does **not** wipe them; `DELETE /admin/scenarios` does.
-Note `/admin/reset` *does* zero the provider-global attempt counter a
-scenario's `attempt_faults` index off, so those faults re-fire after a reset.
+`POST /admin/reset` does **not** wipe them and does **not** touch their
+attempt counters (a provider reset never re-arms a scenario's attempt
+faults; `POST /admin/scenarios/{id}/attempt-count/reset` does that
+explicitly). `DELETE /admin/scenarios` is the lifecycle boundary.
+Replacement (re-POST the same id) swaps in a fresh scenario with fresh
+counters — that re-arms; an in-flight request holding the old scenario
+finishes against the old counter (immutable-swap model).
 
 ## Bedrock Converse / ConverseStream
 
@@ -769,10 +821,18 @@ surfaces): legacy `/v1/completions`, `/v1/embeddings`, `/v1/responses`,
 and `/v1/models`. Their error envelopes ARE validated. Extending coverage
 would first require fixing the known shape drift on those surfaces
 (proposal G5/G6/G7 — Responses API completion is explicitly deferred to
-nanollm's R5 work). Note the `/v1/responses` **stream is in the fault
-loop** (stream-fault injector + SSE transport faults apply); its body
-validation remains **best-effort only** — no Responses root exists in the
-closure. Bedrock bodies are likewise outside the closure entirely (no
+nanollm's R5 work). Note the `/v1/responses` and legacy `/v1/completions`
+**streams are in the fault loop**: the four SSE stream surfaces (chat,
+messages, responses, legacy completions) share the identical pipeline —
+stream-fault injector + SSE transport faults + the legacy
+disconnect/malformed knobs — while Bedrock ConverseStream, the fifth
+stream surface, rides the same injector in its eventstream dialects but
+not the SSE transport faults (eventstream has its own binary framing).
+Responses/legacy-completions body validation remains **best-effort
+only** — no root for them exists in the closure. The
+completions stream is two real frames (content, finish) + `[DONE]`, and
+`after_n` fires AFTER the Nth real frame: `after_n=1` cuts between content
+and finish, `after_n=2` cuts before `[DONE]`. Bedrock bodies are likewise outside the closure entirely (no
 pinned Bedrock spec); their tripwire is the SDK-decode test suite.
 
 The runtime accept/reject surface intentionally differs from nanollm's
@@ -809,8 +869,8 @@ cd ../nanollm && MOCKLM_BINARY=../go-mocklm/mocklm cargo test --test integration
 
 | Gap | Impact |
 |---|---|
-| **No tool/function call emulation** | Can't test tool_calls proxy path |
-| **No `finish_reason` variations** | Always returns `"stop"` / `"end_turn"` — no `"length"`, `"content_filter"`, `"tool_calls"` |
+| ~~**No tool/function call emulation**~~ | ~~Can't test tool_calls proxy path~~ (resolved, bounded: `tool_use_response = true` echoes the first tool the request offered — `tool_calls` / `tool_use` blocks with mock input, `finish_reason: "tool_calls"` / `stop_reason: "tool_use"`. It is a tool-*echo*, not scripted tool outputs: exact per-call arguments can't be pinned, and scenario exact `output` cannot combine with it) |
+| ~~**No `finish_reason` variations**~~ | ~~Always returns `"stop"` / `"end_turn"` — no `"length"`, `"content_filter"`, `"tool_calls"`~~ (resolved: `stop_reason` overrides the emitted value verbatim — OpenAI `finish_reason` e.g. `"content_filter"`, Anthropic `stop_reason` e.g. `"pause_turn"`, `"refusal"`; `tool_use_response` produces the tool-call variants) |
 | ~~**No configurable response content**~~ | ~~Content is random words from a fixed vocabulary; can't return specific text for transform testing~~ (resolved: the scenario registry pins exact output bytes — text + thinking + delta chunking — per `(provider, model)` or `X-MockLM-Scenario` header) |
 | ~~**No per-request fault injection**~~ | ~~Faults are global config; can't target a single request via header~~ (resolved: `X-MockLM-Fault` header overlays any provider knob per request) |
 | ~~**No request recording**~~ | ~~No way to inspect what requests mocklm received~~ (resolved: all providers now record requests via `/admin/requests`) |
@@ -823,5 +883,5 @@ cd ../nanollm && MOCKLM_BINARY=../go-mocklm/mocklm cargo test --test integration
 | **No Google/Gemini provider** | OpenAI, Anthropic, and Bedrock Converse only |
 | **Bedrock: plain model IDs only** | ARNs / cross-region inference-profile IDs contain `/` and don't route through `{modelId}`; needs a custom `RequestURI` parser if ever required |
 | **Bedrock: no schema validation, text-only** | No pinned Bedrock spec in the closure; no `toolUse` / `reasoningContent` blocks — fidelity is hand-rolled, bounded, and pinned by the aws-sdk-go-v2 decode tests |
-| **Capture is body-exact, not wire-exact** | Scenario `last-request` preserves body bytes exactly; repeated headers, header order, query string, and TLS/ALPN are not captured (the server is cleartext HTTP/1.1) |
-| **Per-scenario rate/concurrency not supported** | `rate_limit_rpm` / `max_concurrent` / attempt sequence stay provider-global; scenario configs setting them are rejected at register |
+| **Capture is body-exact, not wire-exact** | Scenario `last-request` preserves body bytes exactly; repeated headers, header order, and the query string are not captured. The negotiated protocol IS: the [TLS lane](#listeners-https--h2alpn-observation-lane) records `HTTP/2.0` vs `HTTP/1.1` per request (`proto` in `/admin/requests`, `X-MockLM-Captured-Protocol` on captures) |
+| **Per-scenario rate/concurrency not supported** | `rate_limit_rpm` / `max_concurrent` stay provider-global; scenario configs setting them are rejected at register (the fault-attempt sequence IS per-scenario — see `/admin/scenarios/{id}/attempt-count`) |

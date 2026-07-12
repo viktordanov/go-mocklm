@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// --- Phase 2a: two-knob fault engine (WHEN × HOW), per-attempt fault
+// --- Two-knob fault engine (WHEN × HOW), per-attempt fault
 // arrays, request-count introspection, and the decoder-fault group
 // (B1 unknown_event / B2 unknown_block / B5 stream_error) ---
 
@@ -189,7 +189,7 @@ func TestFaultSpecUnknownModeRejected(t *testing.T) {
 }
 
 func TestFaultSpecDisconnectAfterEvent(t *testing.T) {
-	// The generalized engine expresses the Phase-0 disconnect_after_event
+	// The generalized engine expresses the legacy disconnect_after_event
 	// knob as {mode: disconnect, after_event: ...}: the stream carries
 	// message_delta and is severed before message_stop.
 	cfg := defaultConfig()

@@ -250,7 +250,7 @@ func TestRuntimeConfigSwitch(t *testing.T) {
 	srv, state := testServerWithState(defaultConfig())
 	defer srv.Close()
 
-	// Phase 1: healthy — request should succeed
+	// Step 1: healthy — request should succeed
 	resp, err := postJSON(srv.URL+"/v1/chat/completions", openaiChatBody(false), nil)
 	if err != nil {
 		t.Fatalf("healthy request failed: %v", err)
@@ -261,7 +261,7 @@ func TestRuntimeConfigSwitch(t *testing.T) {
 		t.Fatalf("expected 200 in healthy phase, got %d", resp.StatusCode)
 	}
 
-	// Phase 2: switch to openai-disconnect preset
+	// Step 2: switch to openai-disconnect preset
 	presets := builtinPresets()
 	preset := presets["openai-disconnect"]
 	openai := preset.OpenAI
@@ -286,7 +286,7 @@ func TestRuntimeConfigSwitch(t *testing.T) {
 		t.Error("expected no [DONE] after disconnect, but found it")
 	}
 
-	// Phase 3: reset back to healthy
+	// Step 3: reset back to healthy
 	state.Reset()
 
 	resp, err = postJSON(srv.URL+"/v1/chat/completions", openaiChatBody(true), nil)

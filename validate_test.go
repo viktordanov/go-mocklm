@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// --- Phase 1: validate_responses self-validation mode ---
+// --- validate_responses self-validation mode ---
 
 func boolPtr(b bool) *bool { return &b }
 

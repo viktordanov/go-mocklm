@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// --- Phase 1: request fidelity, tool echo, stop_reason/cache config ---
+// --- Request fidelity, tool echo, stop_reason/cache config ---
 
 func postAnthropic(t *testing.T, url, body string) *http.Response {
 	t.Helper()

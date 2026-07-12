@@ -13,7 +13,7 @@ import (
 	"github.com/viktordanov/go-mocklm/internal/specsync"
 )
 
-// --- Phase 1: spec-sync closure drift tripwire ---
+// --- Spec-sync closure drift tripwire ---
 //
 // go-mocklm's validator runs against schemas extracted from nanollm's
 // sha256-pinned specs (spec/pins.json records which). These tests fail

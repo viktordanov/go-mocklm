@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// AWS Bedrock Runtime Converse / ConverseStream mock (Phase 3c) — the third
+// AWS Bedrock Runtime Converse / ConverseStream mock — the third
 // provider:
 //
 //	POST /model/{modelId}/converse          -> JSON response
@@ -75,6 +75,7 @@ func handleBedrockConverse(state *ServerState, stream bool) http.HandlerFunc {
 			Provider:  "bedrock",
 			Method:    r.Method,
 			Path:      r.URL.Path,
+			Proto:     r.Proto,
 			Headers:   headers,
 			Body:      json.RawMessage(rawBody),
 		})
@@ -114,6 +115,9 @@ func handleBedrockConverse(state *ServerState, stream bool) http.HandlerFunc {
 			exact = sc.Output
 		}
 
+		if rejectLeakedCacheControl(w, &cfg, "bedrock", rawBody) {
+			return
+		}
 		if checkFaults(w, r, &cfg, limiter, state, "bedrock") {
 			return
 		}

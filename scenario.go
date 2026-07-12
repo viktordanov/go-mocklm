@@ -11,25 +11,30 @@ import (
 	"time"
 )
 
-// Scenario registry (Phase 3a): a scenario is a named exact-output spec +
+// Scenario registry: a scenario is a named exact-output spec +
 // fault set + its own capture/counter slot, matched per request by the
 // X-MockLM-Scenario header or by (provider, model).
 //
-// v1 scoping (K1/D1, deliberate): a scenario scopes CONTENT + FAULTS +
-// CAPTURE only. rate_limit_rpm, max_concurrent, and the attempt counter
-// driving fail_first_n / attempt_faults stay PROVIDER-GLOBAL — two
-// scenarios sharing one provider share the provider's concurrency gate, RPM
-// limiter, and attempt sequence, so per-scenario attempt_faults are NOT
-// independent across scenarios on the same provider. Registering a scenario
-// whose config sets rate_limit_rpm or max_concurrent is REJECTED with 400
-// (R5) rather than silently ignored.
+// Scoping (K1/D1, deliberate): a scenario scopes CONTENT + FAULTS +
+// CAPTURE + its own FAULT-ATTEMPT SEQUENCE. A matched scenario's
+// fail_first_n / attempt_faults index the scenario's own counter
+// (faultAttempts, exposed at /admin/scenarios/{id}/attempt-count), so two
+// scenarios on one provider — and any non-scenario background traffic —
+// have fully independent fault sequences under parallel load. Only
+// rate_limit_rpm and max_concurrent stay PROVIDER-GLOBAL: two scenarios
+// sharing one provider share the provider's concurrency gate and RPM
+// limiter, and registering a scenario whose config sets either is REJECTED
+// with 400 (R5) rather than silently ignored. The provider request counter
+// (/admin/request-count) still counts scenario traffic — it is an
+// observability oracle, not the fault index.
 //
 // Lifecycle (R6, deliberate): scenarios are test fixtures with independent
 // lifetimes — POST /admin/reset does NOT wipe them (use DELETE
-// /admin/scenarios). Reset DOES zero the provider-global attempt counter a
-// scenario's attempt_faults index off, so those faults re-fire after a
-// reset; that counter is also advanced by every non-scenario request on the
-// same provider.
+// /admin/scenarios) and does NOT touch their fault-attempt counters, so a
+// provider config reset never re-arms a scenario's attempt faults.
+// Replacement (re-POST the same id) swaps in a brand-new *Scenario with
+// fresh counters — that re-arms; a request already holding the old pointer
+// finishes against the old counter (the registry's immutable-swap model).
 
 // Chunking controls how exact output text is sliced into stream deltas —
 // the application boundary a decoder reassembles. It is a different layer
@@ -122,9 +127,11 @@ func surfaceForProvider(provider string) string {
 
 // CapturedRequest is a per-scenario snapshot of the last matched request.
 // It is BODY-exact, not wire-exact (K13/D3): RawBody is byte-for-byte what
-// arrived, but Headers collapses repeated values and ordering, Path drops
-// the query string, and Protocol (r.Proto) is inert on the cleartext server
-// — adequate for body-diff oracles, not wire-fidelity assertions.
+// arrived, but Headers collapses repeated values and ordering and Path
+// drops the query string — adequate for body-diff oracles, not full
+// wire-fidelity assertions. Protocol (r.Proto) IS meaningful: on the TLS
+// lane it reports the ALPN-negotiated protocol ("HTTP/2.0" vs "HTTP/1.1",
+// see tls.go); on the clear-text lane it is always "HTTP/1.1".
 type CapturedRequest struct {
 	RawBody   []byte
 	Method    string
@@ -143,11 +150,21 @@ type Scenario struct {
 
 	// captureCount counts matched-raw-requests: every request that matched
 	// this scenario, incremented exactly once at the capture point. NOT the
-	// attempt counter — that one is provider-global, owned solely by
-	// checkFaults (K6), and independently counts requests that reached
-	// fault processing.
+	// fault-attempt counter below — capture happens before checkFaults, so
+	// the two can differ (e.g. a malformed X-MockLM-Fault header is
+	// captured but rejected before attempt accounting).
 	captureCount atomic.Int64
-	lastRequest  atomic.Pointer[CapturedRequest]
+	// faultAttempts is the scenario's own fault-attempt sequence: bumped by
+	// checkFaults (via the request-local config's faultAttemptCounter) for
+	// every matched request that reaches fault processing, and the ONLY
+	// counter this scenario's fail_first_n / attempt_faults index. Zeroed
+	// by POST /admin/scenarios/{id}/attempt-count/reset and implicitly by
+	// replacement (a fresh *Scenario); deliberately NOT by /admin/reset.
+	// Same-scenario concurrent requests are ordered by the atomic increment
+	// — linearizable, but which caller draws attempt 1 is scheduler-
+	// dependent; per-scenario isolation does not promise caller identity.
+	faultAttempts atomic.Int64
+	lastRequest   atomic.Pointer[CapturedRequest]
 }
 
 // capture records a matched request (R7: called right after the scenario
@@ -388,12 +405,15 @@ func rejectScenarioHeaderUnwired(w http.ResponseWriter, r *http.Request, cfg *Pr
 // Config with the PROVIDER-GLOBAL knobs (rate_limit_rpm / max_concurrent)
 // carried over from the provider snapshot so the shared limiter and the
 // introspection surface keep working (K1; scenario configs cannot set them,
-// R5).
+// R5). The scenario's fault-attempt counter rides along so checkFaults
+// indexes fail_first_n / attempt_faults off THIS scenario's sequence
+// instead of the provider counter.
 func applyScenario(sc *Scenario, r *http.Request, rawBody []byte, providerCfg *ProviderConfig) ProviderConfig {
 	sc.capture(r, rawBody)
 	cfg := sc.Config
 	cfg.RateLimitRPM = providerCfg.RateLimitRPM
 	cfg.MaxConcurrent = providerCfg.MaxConcurrent
+	cfg.faultAttemptCounter = &sc.faultAttempts
 	return cfg
 }
 
@@ -537,8 +557,9 @@ func handleAdminScenarioLastRequest(state *ServerState) http.HandlerFunc {
 
 // handleAdminScenarioRequestCount returns {"count": N} where N counts
 // matched-raw-requests (every request that matched this scenario id) — NOT
-// "attempts that reached fault processing", which is the provider-global
-// counter at /admin/request-count (K6).
+// "attempts that reached fault processing": that is the scenario's own
+// fault-attempt counter at /admin/scenarios/{id}/attempt-count, and the
+// provider-wide one at /admin/request-count (K6).
 func handleAdminScenarioRequestCount(state *ServerState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sc, ok := state.Scenarios().Lookup(r.PathValue("id"))
@@ -552,7 +573,8 @@ func handleAdminScenarioRequestCount(state *ServerState) http.HandlerFunc {
 }
 
 // handleAdminScenarioResetRequestCount zeroes one scenario's matched
-// counter.
+// counter (capture-only; the fault-attempt counter has its own reset at
+// /admin/scenarios/{id}/attempt-count/reset).
 func handleAdminScenarioResetRequestCount(state *ServerState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sc, ok := state.Scenarios().Lookup(r.PathValue("id"))
@@ -561,6 +583,42 @@ func handleAdminScenarioResetRequestCount(state *ServerState) http.HandlerFunc {
 			return
 		}
 		sc.captureCount.Store(0)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"status": "reset"})
+	}
+}
+
+// handleAdminScenarioAttemptCount returns {"count": N} where N is the
+// scenario's fault-attempt sequence position — how many matched requests
+// reached fault processing since registration/replacement or the last
+// attempt-count reset. This is the counter the scenario's fail_first_n /
+// attempt_faults index, and the retry-test oracle: after a client's
+// retry loop, assert exactly how many attempts THIS scenario absorbed,
+// independent of any other traffic on the provider.
+func handleAdminScenarioAttemptCount(state *ServerState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sc, ok := state.Scenarios().Lookup(r.PathValue("id"))
+		if !ok {
+			writeErrorResponse(w, nil, 404, "admin", "not_found", "Unknown scenario: "+r.PathValue("id"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"count": sc.faultAttempts.Load()})
+	}
+}
+
+// handleAdminScenarioResetAttemptCount zeroes one scenario's fault-attempt
+// counter, re-arming its fail_first_n / attempt_faults sequence from
+// attempt 1 — without touching its capture state, any other scenario, or
+// the provider counters.
+func handleAdminScenarioResetAttemptCount(state *ServerState) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sc, ok := state.Scenarios().Lookup(r.PathValue("id"))
+		if !ok {
+			writeErrorResponse(w, nil, 404, "admin", "not_found", "Unknown scenario: "+r.PathValue("id"))
+			return
+		}
+		sc.faultAttempts.Store(0)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"status": "reset"})
 	}
